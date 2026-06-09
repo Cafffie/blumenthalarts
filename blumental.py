@@ -219,7 +219,7 @@ def extract_events(driver, category):
         try:
             title_el = card.find_element(By.CSS_SELECTOR, "h3.title a, h2.title a, .event-title a, a.event-link")
             title = title_el.get_attribute("textContent").strip()
-            venue_url = title_el.get_attribute("href")
+            event_url = title_el.get_attribute("href")
 
             try:
               venue = card.find_element(By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue").get_attribute("textContent").strip()
@@ -234,12 +234,12 @@ def extract_events(driver, category):
                 continue
             seen_titles.add(title.lower())
 
-            if not venue_url or not venue_url.startswith("http"):
+            if not event_url or not event_url.startswith("http"):
                 continue
 
             events.append({
                 "title": title,
-                "venue_url": venue_url,
+                "event_url": event_url,
                 "category": category,
                 "venue": venue
             })
@@ -562,7 +562,7 @@ def scrape_shows():
         for i, e in enumerate(events[-2:], start=1):
             log(f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{len(events)} → {e['title']}")
 
-            if not safe_get(driver, e["venue_url"]):
+            if not safe_get(driver, e["event_url"]):
                 continue
 
 
