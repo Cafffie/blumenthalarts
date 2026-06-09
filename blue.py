@@ -219,7 +219,7 @@ def extract_events(driver, category):
         try:
             title_el = card.find_element(By.CSS_SELECTOR, "h3.title a, h2.title a, .event-title a, a.event-link")
             title = title_el.get_attribute("textContent").strip()
-            venue_url = title_el.get_attribute("href")
+            event_url = title_el.get_attribute("href")
 
             try:
               venue = card.find_element(By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue").get_attribute("textContent").strip()
@@ -234,12 +234,12 @@ def extract_events(driver, category):
                 continue
             seen_titles.add(title.lower())
 
-            if not venue_url or not venue_url.startswith("http"):
+            if not event_url or not event_url.startswith("http"):
                 continue
 
             events.append({
                 "title": title,
-                "venue_url": venue_url,
+                "event_url": event_url,
                 "category": category,
                 "venue": venue
             })
@@ -252,13 +252,13 @@ def extract_events(driver, category):
 # ============================================================
 # PERFORMANCE DATES HELPER FUNCTIONS
 # ============================================================
-def _parse_performance_datetime(block, current_year):
+def _parse_performance_datetime(block, year):
     """Helper to parse date and time from a performance block element."""
     try:
         month = block.find_element(By.CSS_SELECTOR, ".m-date__month, .month").text.strip()
         day = block.find_element(By.CSS_SELECTOR, ".m-date__day, .day").text.strip()
         time_text = block.find_element(By.CSS_SELECTOR, "span.time.cell, .time").text.strip()
-        date_string = f"{month} {day} {current_year} {time_text}"
+        date_string = f"{month} {day} {year} {time_text}"
         return parse_date(date_string)
     except:
         # Alternative layout raw text fallback
@@ -269,53 +269,58 @@ def _parse_performance_datetime(block, current_year):
 # ============================================================
 # PERFORMANCE DATES EXTRACTION
 # ============================================================
+from selenium.webdriver.common.by import By
+from datetime import datetime
+
 def extract_events_performance_dates(driver):
     """Extract event performance dates, times, and booking link with year and venue info."""
-
     log("🎭 Extracting individual performances and site metadata...")
     performances = []
 
     try:
         # 1. Extract Global Metadata (Year and Venue URL)
+        # Using CSS Selectors based on your provided HTML
         try:
+            # Look for the year in the heading section
             year = driver.find_element(By.CSS_SELECTOR, ".event_heading .m-date__year").text.replace(",", "").strip()
         except:
             year = str(datetime.now().year) # Fallback to current year
 
         try:
+            # Look for the venue link in the event_venue div
             venue_url = driver.find_element(By.CSS_SELECTOR, ".event_venue a").get_attribute("href")
         except:
             venue_url = None
 
-        blocks = driver.find_elements(By.CSS_SELECTOR, "div.event_showings li.listItem, .performance-list li, .showing-item")
-        if not blocks:
-            blocks = driver.find_elements(By.CSS_SELECTOR, ".performances .item")
-
-        log(f"📦 Found {len(blocks)} performance rows")
-        current_year = datetime.now().year
+        # 2. Extract Performance Rows
+        blocks = driver.find_elements(By.CSS_SELECTOR, "div.event_showings li.listItem")
+        log(f"📦 Found {len(blocks)} performance rows for the year {year}")
 
         for idx, block in enumerate(blocks, start=1):
             try:
-                # 1. Parse datetime
-                parsed_dt = _parse_performance_datetime(block, current_year)
+                # Assuming _parse_performance_datetime is defined elsewhere
+                # We pass the 'year' we extracted above
+                parsed_dt = _parse_performance_datetime(block, year)
                 date_ymd = parsed_dt.strftime("%Y-%m-%d")
                 time_hm = parsed_dt.strftime("%H:%M")
 
-                # FIX: Corrected button selector matching target structure
                 get_ticket_btn = block.find_element(
-                    By.CSS_SELECTOR, "a.tickets, a.button").get_attribute("href")
+                    By.CSS_SELECTOR, "a.tickets").get_attribute("href")
 
+                # 3. Append data including global metadata
                 performances.append({
                     "date": date_ymd,
                     "time": time_hm,
-                    "get_ticket_btn": get_ticket_btn
+                    "get_ticket_btn": get_ticket_btn,
+                    "year": year,           
+                    "venue_url": venue_url  
                 })
 
             except Exception as e:
                 log(f"⚠️ Single performance parse failed on block index {idx}: {e}", "warning")
 
     except Exception as e:
-        log(f"❌ Structural performance extraction level error: {e}", "warning")
+        log(f"❌ Structural performance extraction error: {e}", "warning")
 
     return performances
 
@@ -323,106 +328,124 @@ def extract_events_performance_dates(driver):
 # SVG SEATMAP SCRAPER
 # ============================================================
 def extract_all_seats(driver):
-  """Extracts seats and pricing from the currently open SVG modal."""
+    """Extracts seats and pricing from the currently open SVG modal without looping infinitely."""
 
-  log("💺 Extracting seats from all seat map sections...")
+    log("💺 Extracting seats from all seat map sections...")
 
-  all_seats = {}
-  click_count = 0
-  section_click_count = 0
-  currency = None
+    all_seats = {}
+    seen_snapshots = set()  #  Track unique seat layouts to prevent loops
+    click_count = 0
+    section_click_count = 0
+    currency = None
 
-  while True:
+    while True:
+        try:
+            # ------------------------------------------------
+            # WAIT FOR SEAT MAP TO SETTLE
+            # ------------------------------------------------
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "circle[data-seat-row], g#screenMap polygon.picker")))
+            time.sleep(2)
 
-    try:
-      # ------------------------------------------------
-      # WAIT FOR SEAT MAP
-      # ------------------------------------------------
-      WebDriverWait(driver, 10).until(EC.presence_of_element_located(
-          (By.CSS_SELECTOR, "circle[data-seat-row], g#screenMap polygon.picker")))
-      time.sleep(2)
+            # =================================================
+            # 1. HANDLE SVG SECTION SELECTION 
+            # =================================================
+            sections = driver.find_elements(By.CSS_SELECTOR, "g#screenMap polygon.picker")
+            if sections:
+                log(f"🧭 Found {len(sections)} seat sections")
 
-      # =================================================
-      # 1. HANDLE SVG SECTION SELECTION (NEW ADDITION)
-      # =================================================
-      sections = driver.find_elements(By.CSS_SELECTOR, "g#screenMap polygon.picker")
-      if sections:
-        log(f"🧭 Found {len(sections)} seat sections")
+                for sec in sections:
+                    aria = sec.get_attribute("aria-label") or ""
 
-        for sec in sections:
-            aria = sec.get_attribute("aria-label") or ""
+                    if sec.is_displayed():
+                        # Click the section to switch views
+                        driver.execute_script("""
+                        var element = arguments[0];
+                        var evt = document.createEvent("MouseEvents");
+                        evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
+                        element.dispatchEvent(evt);
+                        """, sec)
+                        section_click_count += 1
 
-            if sec.is_displayed():
-                driver.execute_script("""
-                var element = arguments[0];
-                var evt = document.createEvent("MouseEvents");
-                evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
-                element.dispatchEvent(evt);
-                """, sec)
-                section_click_count += 1
-
-                log(f"🎭 Clicked section " f"({section_click_count}): {aria}")
-                time.sleep(2)
-                break
-                                                                
-      # Collect currently visible seats
-      seats = driver.find_elements(By.CSS_SELECTOR, "circle[data-seat-row][data-seat-seat]")
-      log(f"📦 Found {len(seats)} seats")
-
-      # Extract seats
-      for seat in seats:
-        row_name = seat.get_attribute("data-seat-row")
-        seat_no = seat.get_attribute("data-seat-seat")
-        section = seat.get_attribute("data-seat-section")
-        zone = seat.get_attribute("data-sectiondescription")
-        aria = (seat.get_attribute("aria-label") or "")
-
-        if not currency:
-            currency = detect_currency(aria)
-
-        match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
-        if not match:
-            continue
+                        log(f"🎭 Clicked section ({section_click_count}): {aria}")
+                        time.sleep(2)  # Give the DOM 2 seconds to load the new seats
+                        break  # Break out of the sections loop to parse the newly loaded elements
+                                                                        
+            # =================================================
+            # 2. COLLECT AND VALIDATE FRESH SEATS (Correct Sequence Placement)
+            # =================================================
+            seats = driver.find_elements(By.CSS_SELECTOR, "circle[data-seat-row][data-seat-seat]")
             
-        price = float(match.group(1))
+            # Create a unique fingerprint string of current rows and seat numbers
+            seat_fingerprint = "|".join(sorted([
+                (s.get_attribute("data-seat-row") or "") + (s.get_attribute("data-seat-seat") or "") 
+                for s in seats
+            ]))
 
-        if price is None:
-            continue
+            #  INFINITE LOOP PROTECTION: Stop if this view has already been scraped
+            if seat_fingerprint in seen_snapshots:
+                log("🔄 Duplicate state detected. Reached the end of sections.")
+                break
+                
+            seen_snapshots.add(seat_fingerprint)
+            log(f"📦 Found {len(seats)} unique seats in this section")
 
-        seat_id = f"{section} {row_name}{seat_no}".strip()
-        # deduplicate
-        all_seats[seat_id] = {
-            "seat": seat_id,
-            "ticket_price": price
-        }
+            # =================================================
+            # 3. EXTRACT SEAT DATA
+            # =================================================
+            for seat in seats:
+                row_name = seat.get_attribute("data-seat-row")
+                seat_no = seat.get_attribute("data-seat-seat")
+                section = seat.get_attribute("data-seat-section")
+                zone = seat.get_attribute("data-sectiondescription")
+                aria = (seat.get_attribute("aria-label") or "")
 
-      # -----------------------------------
-      # CLICK NEXT SECTION ARROW
-      # -----------------------------------
-      try:
-        seatmap_arrow = driver.find_element(By.CSS_SELECTOR, "div.map-container button.bottom-arrow")
-        if not seatmap_arrow.is_displayed():
-          break
+                if not currency:
+                    currency = detect_currency(aria)
 
-        driver.execute_script("arguments[0].click();", seatmap_arrow)
-        click_count += 1
+                match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
+                if not match:
+                    continue
+                    
+                price = float(match.group(1))
 
-        log(f"⬇️ Clicked seat map arrow " f"({click_count})")
-        time.sleep(2)
+                seat_id = f"{section} {row_name}{seat_no}".strip()
+                # Deduplicate records by seat ID
+                all_seats[seat_id] = {
+                    "seat": seat_id,
+                    "ticket_price": price
+                }
 
-      except Exception as e:
-        log("✅ Reached final seat map section")
-        break
+            # -----------------------------------
+            # 4. CLICK NEXT SECTION ARROW
+            # -----------------------------------
+            try:
+                seatmap_arrow = driver.find_element(By.CSS_SELECTOR, "div.map-container button.bottom-arrow")
+                
+                # Enhanced exit condition: Stop if hidden OR explicitly disabled via CSS class
+                if not seatmap_arrow.is_displayed() or "disabled" in (seatmap_arrow.get_attribute("class") or ""):
+                    log("✅ Arrow button is hidden or disabled. Map processing complete.")
+                    break
 
-    except Exception as e:
-        log(f"⚠️ Seat extraction failed: {e}", "warning")
-        break
+                driver.execute_script("arguments[0].click();", seatmap_arrow)
+                click_count += 1
 
-  seat_list = list(all_seats.values())
-  capacity= len(seat_list)
-  log(f"🎟 Total unique seats extracted: " f"{capacity}")
+                log(f"⬇️ Clicked seat map arrow ({click_count})")
+                time.sleep(2)  # Wait for page slide transition
 
-  return seat_list, currency, capacity
+            except Exception as e:
+                log("✅ Reached final seat map section (Arrow element missing)")
+                break
+
+        except Exception as e:
+            log(f"⚠️ Seat extraction failed: {e}", "warning")
+            break
+
+    seat_list = list(all_seats.values())
+    capacity = len(seat_list)
+    log(f"🎟 Total unique seats extracted: {capacity}")
+
+    return seat_list, currency, capacity
 
 # ============================================================
 # SEAT PRICING
@@ -482,15 +505,33 @@ def _extract_seat_pricing_metrics(driver, performances):
 
             for row in rows:
                 try:
+                    # skip sold out
                     availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
                     if "Sold Out" in availability:
                         continue
 
-                    target_row = row
-                    break
+                    # Get row date/time
+                    dt_text = row.find_element(By.CSS_SELECTOR, ".start-date").text.strip()
+                    row_dt = parser.parse(dt_text)
 
-                except:
-                    continue
+                    row_date = row_dt.strftime("%Y-%m-%d")
+                    row_time = row_dt.strftime("%H:%M")
+
+                    # Match current performance
+                    if (
+                        row_date == perf["date"]
+                        and
+                        row_time == perf["time"]
+                    ):
+
+                        target_row = row
+
+                        log(f"✅ Matched performance: " f"{row_date} {row_time}")
+                        break
+
+                except Exception as e:
+                  log(f"⚠️ Row match failed: {e}", "warning")
+                  continue
 
             if not target_row:
                 log("⚠️ No available performance found")
@@ -557,10 +598,10 @@ def scrape_shows():
         scroll_to_load_all(driver)
         events = extract_events(driver, category)
 
-        for i, e in enumerate(events[2:4], start=1):
+        for i, e in enumerate(events[-2:], start=1):
             log(f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{len(events)} → {e['title']}")
 
-            if not safe_get(driver, e["venue_url"]):
+            if not safe_get(driver, e["event_url"]):
                 continue
 
 
@@ -571,6 +612,10 @@ def scrape_shows():
 
             # Find the first performance that successfully extracted a currency string, fallback to None
             currency = next((p.get("currency") for p in performances if p.get("currency")), None)
+            if performances:
+                venue_url = performances[0].get("venue_url") or e["event_url"]
+            else:
+                venue_url = e["event_url"]
 
             if performances:
                 sorted_dates = sorted([p["date"] for p in performances])
@@ -589,7 +634,7 @@ def scrape_shows():
 
             row = {
                 "title": e["title"],
-                "venue_url": e["venue_url"],
+                "venue_url": venue_url,
                 "category": e["category"],
                 "venue": e["venue"] if e["venue"] else "Blumenthal Performing Arts",
                 "address": theatre_details["address"],
