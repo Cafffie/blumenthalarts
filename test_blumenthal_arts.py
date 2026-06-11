@@ -20,7 +20,7 @@ def test_blumenthal_arts_pipeline():
     # Initialize using the framework configuration parameters
     extractor = BlumenthalArtsExtractor(
         local_test=True,  # Restricts processing to a smaller subset of shows
-        show_count=4,  # Limits processing to 1 show for rapid end-to-end iteration
+        show_count=1,  # Limits processing to 1 show for rapid end-to-end iteration
         save_csv_locally=True,  # Saves a verification file directly to the data/ folder
         csv_incremental_mode=False,
     )
