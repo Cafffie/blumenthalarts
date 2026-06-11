@@ -45,15 +45,22 @@ class BlumenthalArtsExtractor(BaseExtractor):
     # ------------------------------------------------------------------ #
 
     def extract(self) -> bytes:
-        """Core extraction loop utilizing SeleniumBase SB context manager."""
+        """Core extraction loop utilizing SeleniumBase SB context manager.
+
+        Phase 1: collect all event listings from category pages (single browser session).
+        Phase 2: extract detail + seat pricing per show (fresh browser per show so a
+                 ChromeDriver crash in one show cannot propagate to subsequent shows).
+        """
         self.all_data = []
 
-        # Inline lazy import of SB to avoid premature driver allocation
         from seleniumbase import SB
 
         self.custom_logger.info("🚀 Starting SeleniumBase Browser Context...")
 
-        # SB configuration parameters matching project requirements
+        # ------------------------------------------------------------------
+        # Phase 1 — collect event listings from all category pages
+        # ------------------------------------------------------------------
+        all_events = []
         with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
             for page_idx, (url, category) in enumerate(PAGES, start=1):
                 self.custom_logger.info(
@@ -66,33 +73,48 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 self._scroll_to_load_all(sb)
                 events = self._extract_events(sb, category)
 
-                # Cap rows for testing if local_test flag is active
                 if self.local_test and self.show_count:
                     events = events[: self.show_count]
                     self.custom_logger.info(
                         f"Capped category items to {self.show_count} for test run."
                     )
 
-                for i, e in enumerate(events, start=1):
-                    self.custom_logger.info(
-                        f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{len(events)} → {e['title']}"
-                    )
+                all_events.extend(events)
 
+        # ------------------------------------------------------------------
+        # Phase 2 — per-show detail extraction (one fresh browser per show)
+        # ------------------------------------------------------------------
+        total = len(all_events)
+        for i, e in enumerate(all_events, start=1):
+            self.custom_logger.info(
+                f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{total} → {e['title']}"
+            )
+            try:
+                with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
                     if not self._safe_get(sb, e["venue_url"]):
                         continue
 
                     self._scroll_to_load_all(sb)
                     performances = self._extract_events_performance_dates(sb)
-                    seat_pricing = self._extract_seat_pricing_metrics(sb, performances)
+                    try:
+                        seat_pricing = self._extract_seat_pricing_metrics(sb, performances)
+                    except Exception as exc:
+                        self.custom_logger.warning(
+                            "Seat pricing extraction failed for %s: %s", e["title"], exc
+                        )
+                        seat_pricing = {}
 
-                    # Dynamically process layout aggregations
-                    capacity = max(
-                        [p.get("capacity", 0) for p in performances], default=0
-                    )
-                    currency = next(
-                        (p.get("currency") for p in performances if p.get("currency")),
-                        "USD",
-                    )
+                    if seat_pricing:
+                        capacity = max(
+                            [p.get("capacity", 0) for p in performances], default=0
+                        ) or 2100
+                        currency = next(
+                            (p.get("currency") for p in performances if p.get("currency")),
+                            "USD",
+                        )
+                    else:
+                        capacity = None
+                        currency = None
 
                     if performances:
                         sorted_dates = sorted([p["date"] for p in performances])
@@ -123,10 +145,10 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         "booking_start_date": open_date,
                         "booking_end_date": close_date,
                         "upcoming_performances": formatted_performances,
-                        "capacity": capacity if capacity > 0 else 2100,
-                        "currency": currency if currency else "USD",
+                        "capacity": capacity,
+                        "currency": currency,
                         "is_limited_run": "True" if close_date else "False",
-                        "seat_pricing": seat_pricing if seat_pricing else {},
+                        "seat_pricing": seat_pricing,
                         "scrape_datetime": get_scrape_datetime(),
                     }
 
@@ -135,6 +157,10 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     self.custom_logger.info(
                         f"✅ Extracted Row Record Saved: {e['title']}"
                     )
+            except Exception as exc:
+                self.custom_logger.error(
+                    "Show extraction failed for %s: %s", e["title"], exc
+                )
 
         return json.dumps(self.all_data, default=str).encode("utf-8")
 
@@ -165,24 +191,24 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
     def _solve_captcha(self, sb) -> None:
         """Use SeleniumBase UC helper when a bot protection page is present."""
-        if not hasattr(sb, "uc_gui_handle_captcha"):
-            self.custom_logger.warning(
-                "SB instance does not expose uc_gui_handle_captcha."
-            )
-            return
-
         try:
             self.custom_logger.info("Attempting Cloudflare captcha solver...")
-            sb.uc_gui_handle_captcha()
+            sb.uc_gui_click_captcha()
             human_delay(2.0, 4.0)
         except Exception as e:
             self.custom_logger.warning("Captcha handler attempt failed: %s", e)
 
     def _is_bot_protection(self, sb) -> bool:
+        url = sb.get_current_url().lower()
+        source = sb.get_page_source().lower()
+        # Only flag genuine challenge pages, not pages that merely use Cloudflare as CDN
         return (
-            "captcha" in sb.get_current_url().lower()
-            or "cloudflare" in sb.get_page_source().lower()
-            or "distil" in sb.get_page_source().lower()
+            "captcha" in url
+            or "challenge" in url
+            or "cf-spinner" in source
+            or "checking your browser" in source
+            or "enable javascript and cookies" in source
+            or "distil_identify_cookie" in source
         )
 
     def _safe_get(self, sb, url, wait=10) -> bool:
@@ -340,7 +366,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         date_string = f"{month} {day} {year} {time_text}"
                         parsed_dt = self._parse_date(date_string)
                     except Exception:
-                        parsed_dt = self._parse_date(block.text.strip())
+                        continue  # skip blocks whose date elements can't be found
 
                     if not parsed_dt:
                         continue
@@ -442,41 +468,47 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
     def _extract_seat_pricing_metrics(self, sb, performances) -> dict:
         seat_pricing = {}
-        main_window = sb.driver.current_window_handle
+        has_seat_map = False
+
+        try:
+            main_window = sb.driver.current_window_handle
+        except Exception as e:
+            self.custom_logger.warning("Browser session lost before seat pricing: %s", e)
+            return {}
 
         for perf in performances:
+            perf_key = f"{perf['date']} {perf['time']}"
             try:
-                sb.open(perf["get_ticket_btn"])
+                sb.uc_open_with_reconnect(perf["get_ticket_btn"], reconnect_time=6)
                 human_delay(1.5, 2.5)
 
+                # Refresh main_window after reconnect — UC mode may assign a new handle
+                try:
+                    main_window = sb.driver.current_window_handle
+                except Exception:
+                    pass
+
                 if len(sb.driver.window_handles) > 1:
-                    new_tab = [h for h in sb.driver.window_handles if h != main_window][
-                        0
-                    ]
+                    new_tab = [h for h in sb.driver.window_handles if h != main_window][0]
                     sb.driver.switch_to.window(new_tab)
 
-                if (
-                    "captcha" in sb.get_current_url().lower()
-                    or "cloudflare" in sb.get_page_source().lower()
-                ):
+                if self._is_bot_protection(sb):
                     self.custom_logger.warning(
-                        "UC Captcha Intercept triggered. Waiting for solution loop..."
+                        "UC Captcha Intercept triggered on ticket page. Solving..."
                     )
-                    sb.uc_gui_handle_captcha()
-                    time.sleep(2)
+                    sb.uc_gui_click_captcha()
+                    human_delay(2.0, 3.0)
 
                 sb.wait_for_element_present("div.result-box-item", timeout=12)
                 rows = sb.find_elements("div.result-box-item")
                 target_row = None
+                is_sold_out = False
 
                 for row in rows:
                     try:
                         availability = row.find_element(
                             By.CSS_SELECTOR, ".availability-text"
                         ).text.strip()
-                        if "Sold Out" in availability:
-                            continue
-
                         dt_text = row.find_element(
                             By.CSS_SELECTOR, ".start-date"
                         ).text.strip()
@@ -486,12 +518,22 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             row_dt.strftime("%Y-%m-%d") == perf["date"]
                             and row_dt.strftime("%H:%M") == perf["time"]
                         ):
-                            target_row = row
+                            if "Sold Out" in availability:
+                                is_sold_out = True
+                            else:
+                                target_row = row
                             break
                     except Exception:
                         continue
 
+                if is_sold_out:
+                    # Performance is sold out — omit from seat_pricing, keep in upcoming_performances
+                    self.custom_logger.info("Performance %s is sold out — omitting from seat_pricing", perf_key)
+                    continue
+
                 if not target_row:
+                    # Performance not found on ticket page (e.g. Cloudflare block) — keep empty entry
+                    seat_pricing[perf_key] = []
                     continue
 
                 buy_button = target_row.find_element(
@@ -501,24 +543,30 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                 seat_list, currency, capacity = self._extract_all_seats(sb)
 
-                perf_key = f"{perf['date']} {perf['time']}"
-                seat_pricing[perf_key] = seat_list
-                perf["capacity"] = capacity
-                perf["currency"] = currency
+                if seat_list:
+                    has_seat_map = True
+                    seat_pricing[perf_key] = seat_list
+                    perf["capacity"] = capacity
+                    perf["currency"] = currency
+                else:
+                    seat_pricing[perf_key] = []
 
-                if sb.driver.current_window_handle != main_window:
-                    sb.driver.close()
-                    sb.driver.switch_to.window(main_window)
-
-            except Exception as e:
-                self.custom_logger.debug(f"Seat pricing mapping instance failure: {e}")
+                # Close any new tab opened by the buy button and return to ticket list
                 try:
                     if sb.driver.current_window_handle != main_window:
                         sb.driver.close()
                         sb.driver.switch_to.window(main_window)
                 except Exception:
                     pass
+
+            except Exception as e:
+                self.custom_logger.debug(f"Seat pricing mapping instance failure: {e}")
+                seat_pricing.setdefault(perf_key, [])
                 continue
+
+        # If no performance yielded actual seat data, the show has no seat map
+        if not has_seat_map:
+            return {}
 
         return seat_pricing
 
