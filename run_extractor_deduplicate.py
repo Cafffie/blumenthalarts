@@ -456,6 +456,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     if match:
                         price = float(match.group(1))
                         seat_id = f"{section} {row_name}{seat_no}".strip()
+                        # Deduplicate records by seat ID
                         all_seats[seat_id] = {"seat": seat_id, "ticket_price": price}
 
                 try:
