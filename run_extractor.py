@@ -5,23 +5,25 @@ Detail:    SeleniumBase UC Mode (navigates to individual show info)
 Seat map:  SVG Map extraction inside individual show ticket pages.
 """
 import json
+import sys
 import re
 import time
 from datetime import date, datetime
 
 import pandas as pd
-from dateutil import parser as dateutil_parser
+from dateutil import parser 
 from selenium.webdriver.common.by import By
 
 from utils.base_extractor import BaseExtractor
 from utils.logger import setup_logger
 from utils.scraping_helpers import (
+    get_currency_from_price,
     get_scrape_datetime,
     human_delay,
     standardize_category,
 )
 
-from .blumenthal_arts_config import PAGES, RUN_HEADLESS
+from .blumenthal_arts_config import PAGES, RUN_HEADLESS, THEATRE_DETAILS_MAP, DEFAULT_THEATRE_DETAILS
 
 logger = setup_logger(__name__, log_to_file=False)
 
@@ -55,7 +57,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
         from seleniumbase import SB
 
-        self.custom_logger.info("🚀 Starting SeleniumBase Browser Context...")
+        self.custom_logger.info(" Starting SeleniumBase Browser Context...")
 
         # ------------------------------------------------------------------
         # Phase 1 — collect event listings from all category pages
@@ -64,7 +66,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
         with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
             for page_idx, (url, category) in enumerate(PAGES, start=1):
                 self.custom_logger.info(
-                    f"\n🌍 CATEGORY CORRELATION {page_idx}/{len(PAGES)} → {category}"
+                    f"\n CATEGORY CORRELATION {page_idx}/{len(PAGES)} → {category}"
                 )
                 sb.sleep(2)
                 if not self._safe_get(sb, url):
@@ -81,13 +83,25 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                 all_events.extend(events)
 
+        
+        # ------------------------------------------------------------------
+        # Deduplicate events by venue_url before running Phase 2
+        # ------------------------------------------------------------------
+        seen_urls = set()
+        unique_events = []
+        for e in all_events:
+            if e["venue_url"] not in seen_urls:
+                seen_urls.add(e["venue_url"])
+                unique_events.append(e)
+        all_events = unique_events
+
         # ------------------------------------------------------------------
         # Phase 2 — per-show detail extraction (one fresh browser per show)
         # ------------------------------------------------------------------
         total = len(all_events)
         for i, e in enumerate(all_events, start=1):
             self.custom_logger.info(
-                f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{total} → {e['title']}"
+                f"\n EVENT SPECIFIC EXTRACTION {i}/{total} → {e['title']}"
             )
             try:
                 with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
@@ -96,14 +110,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                     self._scroll_to_load_all(sb)
                     performances = self._extract_events_performance_dates(sb)
-                    try:
-                        seat_pricing = self._extract_seat_pricing_metrics(sb, performances)
-                    except Exception as exc:
-                        self.custom_logger.warning(
-                            "Seat pricing extraction failed for %s: %s", e["title"], exc
-                        )
-                        seat_pricing = {}
-
+                    
+                    seat_pricing = self._extract_seat_pricing_metrics(sb, performances)
+                    
                     if seat_pricing:
                         capacity = max(
                             [p.get("capacity", 0) for p in performances], default=0
@@ -134,9 +143,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         "title": e["title"],
                         "venue_url": e["venue_url"],
                         "category": standardize_category(e["category"]),
-                        "venue": e["venue"]
-                        if e["venue"]
-                        else "Blumenthal Performing Arts",
+                        "venue": e["venue"]if e["venue"] else "Blumenthal Performing Arts",
                         "address": theatre_details["address"],
                         "city": theatre_details["city"],
                         "country": theatre_details["country"],
@@ -155,7 +162,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     self.all_data.append(row)
                     self.log_record(row)
                     self.custom_logger.info(
-                        f"✅ Extracted Row Record Saved: {e['title']}"
+                        f" Extracted Row Record Saved: {e['title']}"
                     )
             except Exception as exc:
                 self.custom_logger.error(
@@ -238,84 +245,49 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
     def _parse_date(self, text: str) -> date | None:
         try:
-            dt = dateutil_parser.parse(text, dayfirst=True, fuzzy=True)
+            dt = parser.parse(text, dayfirst=True, fuzzy=True)
             if dt.date() < date.today():
                 dt = dt.replace(year=dt.year + 1)
             return dt
         except Exception:
             return None
 
-    def _detect_currency(self, text: str) -> str | None:
-        if not text:
-            return None
-        if "£" in text:
-            return "GBP"
-        elif "$" in text:
-            return "USD"
-        elif "€" in text:
-            return "EUR"
-        return None
-
+    
     def _get_theatre_details(self, theatre_name: str) -> dict:
         normalized_name = theatre_name.lower().strip() if theatre_name else ""
-        theatre_map = {
-            "belk theater": {
-                "address": "130 N Tryon St",
-                "city": "Charlotte",
-                "country": "USA",
-            },
-            "booth playhouse": {
-                "address": "130 N Tryon St",
-                "city": "Charlotte",
-                "country": "USA",
-            },
-            "knight theater": {
-                "address": "550 South Tryon Street",
-                "city": "Charlotte",
-                "country": "USA",
-            },
-            "stage door theater": {
-                "address": "130 N Tryon St",
-                "city": "Charlotte",
-                "country": "USA",
-            },
-        }
-        for key, data in theatre_map.items():
+
+        for key, data in THEATRE_DETAILS_MAP.items():
             if key in normalized_name:
                 return data
-        return {"address": "130 N Tryon St", "city": "Charlotte", "country": "USA"}
+        return DEFAULT_THEATRE_DETAILS
 
-    # ------------------------------------------------------------------ #
-    # Operational Data Pipeline Components                               #
-    # ------------------------------------------------------------------ #
+
+    # ============================================================
+    # EVENTS LIST EXTRACTION
+    # ============================================================
 
     def _extract_events(self, sb, category: str) -> list:
-        self.custom_logger.info(f"🎭 Extracting events for category: {category}")
+        self.custom_logger.info(f" Extracting events for category: {category}")
+
         cards = sb.find_elements("div.eventItem, div.event-list-item, article.event")
         if not cards:
             cards = sb.find_elements(".event")
+        self.custom_logger.info(f" Found {len(cards)} event cards")
 
         events = []
         seen_titles = set()
         for i, card in enumerate(cards, start=1):
             try:
-                title_el = card.find_element(
-                    By.CSS_SELECTOR,
-                    "h3.title a, h2.title a, .event-title a, a.event-link",
-                )
+                title_el = card.find_element(By.CSS_SELECTOR,"h3.title a, h2.title a, .event-title a, a.event-link",)
                 title = title_el.get_attribute("textContent").strip()
                 venue_url = title_el.get_attribute("href")
 
                 try:
-                    venue = (
-                        card.find_element(
-                            By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue"
-                        )
-                        .get_attribute("textContent")
-                        .strip()
-                    )
-                except Exception:
+                    venue = card.find_element(By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue").get_attribute("textContent").strip()
+                except:
                     venue = "Blumenthal Performing Arts"
+
+                self.custom_logger.info(f"  [{i}/{len(cards)}] {title}")
 
                 if title.lower() in seen_titles:
                     continue
@@ -333,41 +305,35 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     }
                 )
             except Exception as e:
-                self.custom_logger.debug(
-                    f"Event list item parse error at index {i}: {e}"
-                )
+                self.custom_logger.debug(f"⚠️ Event list item parse error at block index {i}: {e}")
+        
+        self.custom_logger.debug(f" Total base events extracted: {len(events)}")
         return events
 
+    # ============================================================
+    # PERFORMANCE DATES EXTRACTION
+    # ============================================================
     def _extract_events_performance_dates(self, sb) -> list:
         performances = []
         try:
             try:
-                year = (
-                    sb.find_element(".event_heading .m-date__year")
-                    .text.replace(",", "")
-                    .strip()
-                )
-            except Exception:
+                # Look for the year in the heading section
+                year = sb.find_element(".event_heading .m-date__year").text.replace(",", "").strip()
+            except:
                 year = str(datetime.now().year)
 
             blocks = sb.find_elements("div.event_showings li.listItem")
             for idx, block in enumerate(blocks, start=1):
                 try:
                     try:
-                        month = block.find_element(
-                            By.CSS_SELECTOR, ".m-date__month, .month"
-                        ).text.strip()
-                        day = block.find_element(
-                            By.CSS_SELECTOR, ".m-date__day, .day"
-                        ).text.strip()
-                        time_text = block.find_element(
-                            By.CSS_SELECTOR, "span.time.cell, .time"
-                        ).text.strip()
+                        month = block.find_element(By.CSS_SELECTOR, ".m-date__month, .month").get_attribute("textContent").strip()
+                        day = block.find_element(By.CSS_SELECTOR, ".m-date__day, .day").get_attribute("textContent").strip()
+                        time_text = block.find_element(By.CSS_SELECTOR, "span.time.cell, .time").get_attribute("textContent").strip()
                         date_string = f"{month} {day} {year} {time_text}"
                         parsed_dt = self._parse_date(date_string)
                     except Exception:
-                        continue  # skip blocks whose date elements can't be found
-
+                        continue
+                        
                     if not parsed_dt:
                         continue
 
@@ -393,44 +359,77 @@ class BlumenthalArtsExtractor(BaseExtractor):
             self.custom_logger.warning(f"Structural performance extraction error: {e}")
         return performances
 
-    def _extract_all_seats(self, sb) -> tuple:
-        all_seats = {}
-        seen_snapshots = set()
 
+    # ============================================================
+    # SVG SEATMAP SCRAPER
+    # ============================================================
+    def _extract_all_seats(self, sb) -> tuple:
+        """Extracts seats and pricing from the currently open SVG modal without looping infinitely."""
+
+        self.custom_logger.info(" Extracting seats from all seat map sections...")
+
+        all_seats = {}
+        seen_snapshots = set()  #  Track unique seat layouts to prevent loops
+        click_count = 0
+        section_click_count = 0
         currency = None
 
         while True:
             try:
+                # ------------------------------------------------
+                # WAIT FOR SEAT MAP TO SETTLE
+                # ------------------------------------------------
                 sb.wait_for_element_present(
                     "circle[data-seat-row], g#screenMap polygon.picker", timeout=10
                 )
                 human_delay(1.0, 2.0)
 
-                seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
-                seat_fingerprint = "|".join(
-                    sorted(
-                        [
-                            (s.get_attribute("data-seat-row") or "")
-                            + (s.get_attribute("data-seat-seat") or "")
-                            for s in seats
-                        ]
-                    )
-                )
-
-                if seat_fingerprint in seen_snapshots or not seats:
-                    break
-                seen_snapshots.add(seat_fingerprint)
-
+                # =================================================
+                # 1. HANDLE SVG SECTION SELECTION
+                # =================================================
                 sections = sb.find_elements("g#screenMap polygon.picker")
-                for sec in sections:
-                    if sec.is_displayed():
-                        sb.execute_script(
-                            "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles: true}));",
-                            sec,
-                        )
-                        human_delay(1.0, 1.5)
-                        break
+                if sections:
+                    self.custom_logger.info(f" \nFound {len(sections)} seat sections")
 
+                    for sec in sections:
+                        aria = sec.get_attribute("aria-label") or ""
+
+                        if sec.is_displayed():
+
+                            # Click the section to switch views
+                            sb.execute_script("""
+                            var element = arguments[0];
+                            var evt = document.createEvent("MouseEvents");
+                            evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
+                            element.dispatchEvent(evt);
+                            """, sec)
+                            section_click_count += 1
+
+                            self.custom_logger.info(f" Clicked section ({section_click_count}): {aria}")
+                            human_delay(1.0, 1.5)
+                            break # Break out of the sections loop to parse the newly loaded elements
+
+                # =================================================
+                # 2. COLLECT AND VALIDATE FRESH SEATS (Correct Sequence Placement)
+                # =================================================
+                seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
+                # Create a unique fingerprint string of current rows and seat numbers
+                seat_fingerprint = "|".join(sorted([
+                    (s.get_attribute("data-seat-row") or "") + (s.get_attribute("data-seat-seat") or "") 
+                    for s in seats
+                ]))
+
+                #  INFINITE LOOP PROTECTION: Stop if this view has already been scraped
+                if seat_fingerprint in seen_snapshots:
+                    self.custom_logger.info(" Duplicate state detected. Reached the end of sections.")
+                    break
+
+                seen_snapshots.add(seat_fingerprint)
+                self.custom_logger.info(f" \nFound {len(seats)} unique seats in this section")
+
+                # =================================================
+                # 3. EXTRACT SEAT DATA
+                # =================================================
                 for seat in seats:
                     row_name = seat.get_attribute("data-seat-row")
                     seat_no = seat.get_attribute("data-seat-seat")
@@ -438,56 +437,78 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     aria = seat.get_attribute("aria-label") or ""
 
                     if not currency:
-                        currency = self._detect_currency(aria)
+                        currency = get_currency_from_price(aria)
 
                     match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
-                    if match:
-                        price = float(match.group(1))
-                        seat_id = f"{section} {row_name}{seat_no}".strip()
-                        all_seats[seat_id] = {"seat": seat_id, "ticket_price": price}
+                    if not match:
+                        continue
 
+                    price = float(match.group(1))
+
+                    seat_id = f"{section} {row_name}{seat_no}".strip()
+                    # Deduplicate records by seat ID
+                    all_seats[seat_id] = {
+                        "seat": seat_id,
+                        "ticket_price": price
+                    }
+
+                # -----------------------------------
+                # 4. CLICK NEXT SECTION ARROW
+                # -----------------------------------
                 try:
-                    seatmap_arrow = sb.find_element(
-                        "div.map-container button.bottom-arrow"
-                    )
-                    if (
-                        "disabled" in seatmap_arrow.get_attribute("class")
-                        or not seatmap_arrow.is_displayed()
-                    ):
+                    seatmap_arrow = sb.find_element("div.map-container button.bottom-arrow")
+
+                    # Enhanced exit condition: Stop if hidden OR explicitly disabled via CSS class
+                    if not seatmap_arrow.is_displayed() or "disabled" in (seatmap_arrow.get_attribute("class") or ""):
+                        self.custom_logger.info(" Arrow button is hidden or disabled. Map processing complete.")
                         break
+
                     sb.execute_script("arguments[0].click();", seatmap_arrow)
+                    click_count += 1
+
+                    self.custom_logger.info(f" Clicked seat map arrow ({click_count})")
                     human_delay(1.5, 2.0)
-                except Exception:
+
+                except Exception as e:
+                    self.custom_logger.info(" Reached final seat map section (Arrow element missing)")
                     break
+
             except Exception as e:
                 self.custom_logger.debug(f"Seat canvas extraction subloop failure: {e}")
                 break
 
         seat_list = list(all_seats.values())
-        return seat_list, currency, len(seat_list)
+        capacity = len(all_seats)
+        return seat_list, currency, capacity
 
     def _extract_seat_pricing_metrics(self, sb, performances) -> dict:
         seat_pricing = {}
         has_seat_map = False
 
-        try:
-            main_window = sb.driver.current_window_handle
-        except Exception as e:
-            self.custom_logger.warning("Browser session lost before seat pricing: %s", e)
-            return {}
+        # Save the original event details window handle
+        main_window = sb.driver.current_window_handle
 
-        for perf in performances:
+        for i, perf in enumerate(performances, 1):
+
             perf_key = f"{perf['date']} {perf['time']}"
+
+            self.custom_logger.info(
+                f"  [{i}/{len(performances)}] Seats for {perf['date']} {perf['time']}")
+            
             try:
+
+                start = time.time()
+
+                # -----------------------------------
+                # OPEN GET TICKETS PAGE
+                # -----------------------------------
+                # Clicking the button or loading the link triggers a new tab
                 sb.uc_open_with_reconnect(perf["get_ticket_btn"], reconnect_time=6)
                 human_delay(1.5, 2.5)
-
-                # Refresh main_window after reconnect — UC mode may assign a new handle
-                try:
-                    main_window = sb.driver.current_window_handle
-                except Exception:
-                    pass
-
+   
+                # -----------------------------------
+                # GET TICKETS OPENS NEW TAB
+                # -----------------------------------
                 if len(sb.driver.window_handles) > 1:
                     new_tab = [h for h in sb.driver.window_handles if h != main_window][0]
                     sb.driver.switch_to.window(new_tab)
@@ -499,81 +520,108 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     sb.uc_gui_click_captcha()
                     human_delay(2.0, 3.0)
 
+                # -----------------------------------
+                # WAIT FOR BUY PAGE
+                # -----------------------------------
                 sb.wait_for_element_present("div.result-box-item", timeout=12)
                 rows = sb.find_elements("div.result-box-item")
                 target_row = None
-                is_sold_out = False
+                
 
                 for row in rows:
                     try:
-                        availability = row.find_element(
-                            By.CSS_SELECTOR, ".availability-text"
-                        ).text.strip()
-                        dt_text = row.find_element(
-                            By.CSS_SELECTOR, ".start-date"
-                        ).text.strip()
-                        row_dt = dateutil_parser.parse(dt_text)
+                        # skip sold out
+                        availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
+                        if "Sold Out" in availability:
+                            continue
 
+                        # Get row date/time
+                        dt_text = row.find_element(By.CSS_SELECTOR, ".start-date").text.strip()
+                        row_dt = parser.parse(dt_text)
+
+                        row_date = row_dt.strftime("%Y-%m-%d")
+                        row_time = row_dt.strftime("%H:%M")
+
+                        # Match current performance
                         if (
-                            row_dt.strftime("%Y-%m-%d") == perf["date"]
-                            and row_dt.strftime("%H:%M") == perf["time"]
+                            row_date == perf["date"]
+                            and 
+                            row_time == perf["time"]
                         ):
-                            if "Sold Out" in availability:
-                                is_sold_out = True
-                            else:
-                                target_row = row
-                            break
-                    except Exception:
-                        continue
 
-                if is_sold_out:
-                    # Performance is sold out — omit from seat_pricing, keep in upcoming_performances
-                    self.custom_logger.info("Performance %s is sold out — omitting from seat_pricing", perf_key)
-                    continue
+                            target_row = row
+                        
+                            self.custom_logger.info(f" Matched performance: " f"{row_date} {row_time}")
+                            break
+
+                    except Exception as e:
+                        self.custom_logger.warning(f" Row match failed: {e}", "warning")
+                        continue
 
                 if not target_row:
                     # Performance not found on ticket page (e.g. Cloudflare block) — keep empty entry
-                    seat_pricing[perf_key] = []
+                    self.custom_logger.warning(" No available performance found")
                     continue
 
-                buy_button = target_row.find_element(
-                    By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
-                )
+                #-----------------------------------
+                # CLICK BUY
+                # -----------------------------------
+                buy_button = target_row.find_element(By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen")
                 sb.execute_script("arguments[0].click();", buy_button)
 
+                # ------------------------------------------------
+                # WAIT FOR SEAT MAP
+                # ------------------------------------------------
                 seat_list, currency, capacity = self._extract_all_seats(sb)
 
-                if seat_list:
-                    has_seat_map = True
-                    seat_pricing[perf_key] = seat_list
-                    perf["capacity"] = capacity
-                    perf["currency"] = currency
-                else:
-                    seat_pricing[perf_key] = []
+                
+                seat_pricing[perf_key] = seat_list
+                perf["capacity"] = capacity
+                perf["currency"] = currency
+                    
+                self.custom_logger.info(
+                    f" Seats: {capacity} | "
+                    f"Time: {round(time.time()-start,2)}s"
+                )
 
-                # Close any new tab opened by the buy button and return to ticket list
+
+                
+                # -----------------------------------
+                # CLOSE BUY TAB
+                # -----------------------------------
+                if sb.driver.current_window_handle != main_window:
+                    sb.driver.close()
+                    sb.driver.switch_to.window(main_window)
+                    human_delay(1, 2)
+
+
+            except Exception as e:
+                self.custom_logger.debug(f"⚠️ seat extraction error: {e}", "warning")
+
                 try:
                     if sb.driver.current_window_handle != main_window:
                         sb.driver.close()
                         sb.driver.switch_to.window(main_window)
-                except Exception:
+                except:
                     pass
 
-            except Exception as e:
-                self.custom_logger.debug(f"Seat pricing mapping instance failure: {e}")
-                seat_pricing.setdefault(perf_key, [])
                 continue
-
-        # If no performance yielded actual seat data, the show has no seat map
-        if not has_seat_map:
-            return {}
 
         return seat_pricing
 
 
 def main():
-    extractor = BlumenthalArtsExtractor(local_test=False)
-    extractor.run()
+    extractor = BlumenthalArtsExtractor(
+        local_test=False,
+        save_csv_locally=True,
+        csv_incremental_mode=False
+    )
+
+    result = extractor.run()
+    logger.info(f"Extraction result: {result}")
+
+    if result.get("status") not in ("success", "validation_failed"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
