@@ -103,6 +103,42 @@ def scroll_to_load_all(driver):
 
     log("✅ Finished scrolling")
 
+# ============================================================
+# SOLVE CAPTCHA
+# ============================================================
+def detect_captcha(driver):
+
+    try:
+
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+
+        indicators = [
+            "prove you are human",
+            "verify you are human",
+            "captcha",
+            "checking your browser",
+            "cloudflare",
+            "attention required"
+        ]
+
+        if any(x in body_text for x in indicators):
+            return True
+
+        frames = driver.find_elements(
+            By.CSS_SELECTOR,
+            "iframe[src*='captcha'], "
+            "iframe[src*='recaptcha'], "
+            "iframe[src*='hcaptcha']"
+        )
+
+        if frames:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
 
 # ============================================================
 # DATE PARSER
