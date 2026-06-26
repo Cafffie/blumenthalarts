@@ -120,8 +120,11 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                     if seat_pricing:
                         capacity = (
-                            max([p.get("capacity", 0) for p in performances], default=0)
-                            or 2100
+                            max(
+                                [p.get("capacity", 0) for p in performances],
+                                default=None,
+                            )
+                            
                         )
                         currency = next(
                             (
@@ -453,15 +456,15 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     "circle[data-seat-row], g#screenMap polygon.picker", timeout=10
                 )
                 human_delay(1.0, 2.0)
-
+        
                 # =================================================
                 # 1. HANDLE SVG SECTION SELECTION
                 # =================================================
-                sections = sb.find_elements("g#screenMap polygon.picker")
-                if sections:
-                    self.custom_logger.info(f" \nFound {len(sections)} seat sections")
+                tier_sections = sb.find_elements("g#screenMap polygon.picker")
+                if tier_sections:
+                    self.custom_logger.info(f" \Found {len(tier_sections)} tier seat sections")
 
-                    for sec in sections:
+                    for sec in tier_sections:
                         aria = sec.get_attribute("aria-label") or ""
 
                         if sec.is_displayed():
@@ -477,9 +480,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             )
                             section_click_count += 1
 
-                            self.custom_logger.info(
-                                f" Clicked section ({section_click_count}): {aria}"
-                            )
+                            self.custom_logger.info(" Clicked the tier section")                   
                             human_delay(1.0, 1.5)
                             break  # Break out of the sections loop to parse the newly loaded elements
 
@@ -514,23 +515,38 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # 3. EXTRACT SEAT DATA
                 # =================================================
                 for seat in seats:
-                    row_name = seat.get_attribute("data-seat-row")
-                    seat_no = seat.get_attribute("data-seat-seat")
-                    section = seat.get_attribute("data-seat-section")
-                    aria = seat.get_attribute("aria-label") or ""
+                    try:
+                        # 'A' = Available, 'S' = Sold, 'U' = Unavailable/Hold
+                        status = seat.get_attribute("data-status")
+                        if status == "A":
+                            row_name = seat.get_attribute("data-seat-row")
+                            seat_no = seat.get_attribute("data-seat-seat")
+                            section = seat.get_attribute("data-seat-section")
+                            aria = seat.get_attribute("aria-label") or ""
 
-                    if not currency:
-                        currency = get_currency_from_price(aria)
+                            section_name = section.split()[0].strip()
 
-                    match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
-                    if not match:
-                        continue
+                            if not currency:
+                                currency = get_currency_from_price(aria)
 
-                    price = float(match.group(1))
+                            match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
+                            if not match:
+                                continue
 
-                    seat_id = f"{section} {row_name}{seat_no}".strip()
-                    # Deduplicate records by seat ID
-                    all_seats[seat_id] = {"seat": seat_id, "ticket_price": price}
+                            price = float(match.group(1))
+
+                            seat_id = f"{section} {row_name}{seat_no}".strip()
+                            # Deduplicate records by seat ID
+                            all_seats[seat_id] = {
+                                "seat": seat_id,
+                                "ticket_price": price,
+                            }
+
+                    except Exception as e:
+                        self.custom_logger.debug(
+                            f" couldn't find available seats in this section : {e}",
+                            "warning",
+                        )
 
                 # -----------------------------------
                 # 4. CLICK NEXT SECTION ARROW
@@ -552,12 +568,13 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     sb.execute_script("arguments[0].click();", seatmap_arrow)
                     click_count += 1
 
+                    self.custom_logger.info(f" Finished extracting seats from section : {section_name}")
                     self.custom_logger.info(f" Clicked seat map arrow ({click_count})")
                     human_delay(1.5, 2.0)
 
-                except Exception:
-                    self.custom_logger.info(
-                        " Reached final seat map section (Arrow element missing)"
+                except Exception as e:
+                    self.custom_logger.debug(
+                        f" Reached final seat map section (Arrow element missing): {e}"
                     )
                     break
 
@@ -669,9 +686,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         if next_btn and not sb.is_element_visible(
                             ".disabled"
                         ):  # Check i
-                            old_row = rows[0]
+                            # old_row = rows[0]
                             sb.execute_script("arguments[0].click();", next_btn[0])
-                            sb.wait_for_stale(old_row, timeout=10)
+                            human_delay(1.0, 3.0)
                         else:
                             self.custom_logger.info(
                                 " Reached the last page. No available match found anywhere."
@@ -710,7 +727,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     perf["capacity"] = capacity
                     perf["currency"] = currency
 
-                    self.custom_logger.info(f" Seats: {capacity} ")
+                    self.custom_logger.info(f" Seats: {len(seat_list)} ")
                 else:
                     seat_pricing[perf_key] = []
 
