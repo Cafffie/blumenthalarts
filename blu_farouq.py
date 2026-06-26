@@ -411,22 +411,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
         section_click_count = 0
         currency = None
 
-        # 1. Attempt to find macro-level sections (Polygons)
-        if sb.is_element_visible("g#screenMap polygon.picker"):
-            sections = sb.find_elements("g#screenMap polygon.picker")
-            section_ids = [sec.get_attribute("id") for sec in sections]
-            self.custom_logger.info(
-                f" Found {len(section_ids)} tier sections to process."
-            )
-
-        else:
-            section_ids = [None]  # Fallback: No overlays found
-            self.custom_logger.warning(
-                " Flat-map theater detected. Processing single-view layout."
-            )
-
-        # 2. Iterate through sections
-        for index, sec_id in enumerate(section_ids, 1):
+        while True:
             try:
                 sb.wait_for_element_present(
                     "circle[data-seat-row], g#screenMap polygon.picker", timeout=10
@@ -470,29 +455,14 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                 if seat_fingerprint in seen_snapshots:
                     self.custom_logger.info(
-                        f" Switching to section ({index}/{len(section_ids)}): {aria}"
+                        " Duplicate state detected. Reached the end of sections."
                     )
+                    break
 
-                    # Click the section via JavaScript event injection
-                    sb.execute_script(
-                        """
-                        var element = document.getElementById(arguments[0]);
-                        var evt = document.createEvent("MouseEvents");
-                        evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
-                        element.dispatchEvent(evt);
-                    """,
-                        sec_id,
-                    )
-                    self.custom_logger.info(
-                        f" Processing Section {index}/{len(section_ids)} (ID: {sec_id})..."
-                    )
-                    human_delay(
-                        1.0, 1.5
-                    )  # Stability pause for the DOM to render the seats
-
-                # 3. Scrape visible seats
-                seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
-                self.custom_logger.info(f" Found {len(seats)} seats in current view.")
+                seen_snapshots.add(seat_fingerprint)
+                self.custom_logger.info(
+                    f" Found {len(seats)} unique seats in this section"
+                )
 
                 for seat in seats:
                     row_name = seat.get_attribute("data-seat-row")
