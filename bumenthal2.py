@@ -25,7 +25,9 @@ from utils.scraping_helpers import (
 
 from .blumenthal_arts_config import (
     DEFAULT_THEATRE_DETAILS,
+    MAX_RETRIES,
     PAGES,
+    RETRY_DELAY
     QUEUE_COOKIES,
     RUN_HEADLESS,
     THEATRE_DETAILS_MAP,
@@ -462,7 +464,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # =================================================
                 tier_sections = sb.find_elements("g#screenMap polygon.picker")
                 if tier_sections:
-                    self.custom_logger.info(f" \Found {len(tier_sections)} tier seat sections")
+                    self.custom_logger.info(f" Found {len(tier_sections)} tier seat sections")
 
                     for sec in tier_sections:
                         aria = sec.get_attribute("aria-label") or ""
@@ -623,7 +625,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     sb.driver.switch_to.window(new_tab)
 
                 # -----------------------------------
-                # WAIT FOR BUY PAGE
+                # WAIT FOR BUY PAGE AND MATCH DATES
                 # -----------------------------------
                 target_row = None
                 is_sold_out = False
