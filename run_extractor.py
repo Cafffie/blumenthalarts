@@ -5,25 +5,35 @@ Detail:    SeleniumBase UC Mode (navigates to individual show info)
 Seat map:  SVG Map extraction inside individual show ticket pages.
 """
 import json
-import sys
 import re
-import time
+import sys
 from datetime import date, datetime
 
 import pandas as pd
-from dateutil import parser 
+from dateutil import parser
 from selenium.webdriver.common.by import By
 
 from utils.base_extractor import BaseExtractor
 from utils.logger import setup_logger
 from utils.scraping_helpers import (
+    accept_cookies,
     get_currency_from_price,
     get_scrape_datetime,
     human_delay,
+    human_scroll,
+    safe_get_denver,
     standardize_category,
 )
 
-from .blumenthal_arts_config import PAGES, RUN_HEADLESS, THEATRE_DETAILS_MAP, DEFAULT_THEATRE_DETAILS
+from .blumenthal_arts_config import (
+    DEFAULT_THEATRE_DETAILS,
+    MAX_RETRIES,
+    PAGES,
+    QUEUE_COOKIES,
+    RETRY_DELAY,
+    RUN_HEADLESS,
+    THEATRE_DETAILS_MAP,
+)
 
 logger = setup_logger(__name__, log_to_file=False)
 
@@ -68,11 +78,23 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 self.custom_logger.info(
                     f"\n CATEGORY CORRELATION {page_idx}/{len(PAGES)} → {category}"
                 )
-                sb.sleep(2)
-                if not self._safe_get(sb, url):
+                human_delay(1.5, 3.0)
+
+                loaded = False
+                for attempt in range(1, MAX_RETRIES + 1):
+                    if safe_get_denver(sb, url):
+                        loaded = True
+                        break
+                    self.custom_logger.warning(
+                        f"Listing load attempt {attempt}/{MAX_RETRIES} failed for {url}"
+                    )
+                    if attempt < MAX_RETRIES:
+                        human_delay(*RETRY_DELAY)
+
+                if not loaded:
                     continue
 
-                self._scroll_to_load_all(sb)
+                human_scroll(sb)
                 events = self._extract_events(sb, category)
 
                 if self.local_test and self.show_count:
@@ -83,7 +105,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                 all_events.extend(events)
 
-        
         # ------------------------------------------------------------------
         # Deduplicate events by venue_url before running Phase 2
         # ------------------------------------------------------------------
@@ -103,70 +124,96 @@ class BlumenthalArtsExtractor(BaseExtractor):
             self.custom_logger.info(
                 f"\n EVENT SPECIFIC EXTRACTION {i}/{total} → {e['title']}"
             )
-            try:
-                with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
-                    if not self._safe_get(sb, e["venue_url"]):
-                        continue
 
-                    self._scroll_to_load_all(sb)
-                    performances = self._extract_events_performance_dates(sb)
-                    
-                    seat_pricing = self._extract_seat_pricing_metrics(sb, performances)
-                    
-                    if seat_pricing:
-                        capacity = max(
-                            [p.get("capacity", 0) for p in performances], default=0
-                        ) or 2100
-                        currency = next(
-                            (p.get("currency") for p in performances if p.get("currency")),
-                            "USD",
+            extracted = False
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    with SB(uc=True, headless=RUN_HEADLESS, rtf=True) as sb:
+                        if not safe_get_denver(sb, e["venue_url"]):
+                            raise RuntimeError(f"Failed to load {e['venue_url']}")
+
+                        human_scroll(sb)
+                        performances = self._extract_events_performance_dates(sb)
+
+                        seat_pricing = self._extract_seat_pricing_metrics(
+                            sb, performances
                         )
-                    else:
-                        capacity = None
-                        currency = None
 
-                    if performances:
-                        sorted_dates = sorted([p["date"] for p in performances])
-                        open_date = sorted_dates[0]
-                        close_date = sorted_dates[-1]
-                    else:
-                        open_date = datetime.now().strftime("%Y-%m-%d")
-                        close_date = datetime.now().strftime("%Y-%m-%d")
+                        if seat_pricing:
+                            capacity = (
+                                max(
+                                    (p.get("capacity", 0) for p in performances),
+                                    default=0,
+                                )
+                                or None
+                            )
+                            currency = next(
+                                (
+                                    p.get("currency")
+                                    for p in performances
+                                    if p.get("currency")
+                                ),
+                                "USD",
+                            )
+                        else:
+                            capacity = None
+                            currency = None
 
-                    formatted_performances = [
-                        {"date": p["date"], "time": p["time"]} for p in performances
-                    ]
+                        if performances:
+                            sorted_dates = sorted([p["date"] for p in performances])
+                            open_date = sorted_dates[0]
+                            close_date = sorted_dates[-1]
+                        else:
+                            open_date = datetime.now().strftime("%Y-%m-%d")
+                            close_date = datetime.now().strftime("%Y-%m-%d")
 
-                    theatre_details = self._get_theatre_details(e["venue"])
+                        formatted_performances = [
+                            {"date": p["date"], "time": p["time"]} for p in performances
+                        ]
 
-                    row = {
-                        "title": e["title"],
-                        "venue_url": e["venue_url"],
-                        "category": standardize_category(e["category"]),
-                        "venue": e["venue"]if e["venue"] else "Blumenthal Performing Arts",
-                        "address": theatre_details["address"],
-                        "city": theatre_details["city"],
-                        "country": theatre_details["country"],
-                        "open_date": open_date,
-                        "close_date": close_date,
-                        "booking_start_date": open_date,
-                        "booking_end_date": close_date,
-                        "upcoming_performances": formatted_performances,
-                        "capacity": capacity,
-                        "currency": currency,
-                        "is_limited_run": "True" if close_date else "False",
-                        "seat_pricing": seat_pricing,
-                        "scrape_datetime": get_scrape_datetime(),
-                    }
+                        theatre_details = self._get_theatre_details(e["venue"])
 
-                    self.all_data.append(row)
-                    self.log_record(row)
-                    self.custom_logger.info(
-                        f" Extracted Row Record Saved: {e['title']}"
+                        row = {
+                            "title": e["title"],
+                            "venue_url": e["venue_url"],
+                            "category": standardize_category(e["category"]),
+                            "venue": e["venue"]
+                            if e["venue"]
+                            else "Blumenthal Performing Arts",
+                            "address": theatre_details["address"],
+                            "city": theatre_details["city"],
+                            "country": theatre_details["country"],
+                            "open_date": open_date,
+                            "close_date": close_date,
+                            "booking_start_date": open_date,
+                            "booking_end_date": close_date,
+                            "upcoming_performances": formatted_performances,
+                            "capacity": capacity,
+                            "currency": currency,
+                            "is_limited_run": "True" if close_date else "False",
+                            "seat_pricing": seat_pricing,
+                            "scrape_datetime": get_scrape_datetime(),
+                        }
+
+                        self.all_data.append(row)
+                        self.log_record(row)
+                        self.custom_logger.info(
+                            f" Extracted Row Record Saved: {e['title']}"
+                        )
+                        extracted = True
+                        break
+
+                except Exception as exc:
+                    self.custom_logger.warning(
+                        f"Show extraction attempt {attempt}/{MAX_RETRIES} failed "
+                        f"for {e['title']}: {exc}"
                     )
-            except Exception as exc:
+                    if attempt < MAX_RETRIES:
+                        human_delay(*RETRY_DELAY)
+
+            if not extracted:
                 self.custom_logger.error(
-                    "Show extraction failed for %s: %s", e["title"], exc
+                    f"All {MAX_RETRIES} attempts failed for {e['title']}"
                 )
 
         return json.dumps(self.all_data, default=str).encode("utf-8")
@@ -182,64 +229,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
         return df
 
     # ------------------------------------------------------------------ #
-    # Browser Safe Navigation Helpers                                    #
-    # ------------------------------------------------------------------ #
-
-    def _scroll_to_load_all(self, sb):
-        """Standard automated scrolling interface inside the framework canvas."""
-        last_height = sb.execute_script("return document.body.scrollHeight")
-        while True:
-            sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            human_delay(1.5, 2.5)
-            new_height = sb.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
-
-    def _solve_captcha(self, sb) -> None:
-        """Use SeleniumBase UC helper when a bot protection page is present."""
-        try:
-            self.custom_logger.info("Attempting Cloudflare captcha solver...")
-            sb.uc_gui_click_captcha()
-            human_delay(2.0, 4.0)
-        except Exception as e:
-            self.custom_logger.warning("Captcha handler attempt failed: %s", e)
-
-    def _is_bot_protection(self, sb) -> bool:
-        url = sb.get_current_url().lower()
-        source = sb.get_page_source().lower()
-        # Only flag genuine challenge pages, not pages that merely use Cloudflare as CDN
-        return (
-            "captcha" in url
-            or "challenge" in url
-            or "cf-spinner" in source
-            or "checking your browser" in source
-            or "enable javascript and cookies" in source
-            or "distil_identify_cookie" in source
-        )
-
-    def _safe_get(self, sb, url, wait=10) -> bool:
-        """Safely navigates using Undetected-Chromatography reconnect checks."""
-        try:
-            self.custom_logger.info("Loading URL: %s", url)
-            sb.uc_open_with_reconnect(url, reconnect_time=wait if wait > 4 else 4)
-
-            if self._is_bot_protection(sb):
-                self.custom_logger.warning("Bot protection detected. Solving...")
-                self._solve_captcha(sb)
-                sb.uc_open_with_reconnect(url, reconnect_time=wait if wait > 4 else 4)
-                if self._is_bot_protection(sb):
-                    self.custom_logger.error(
-                        "Bot protection still present after captcha handler"
-                    )
-                    return False
-
-            return True
-        except Exception as e:
-            self.custom_logger.error(f"Failed to load page: {url} | Exception: {e}")
-            return False
-
-    # ------------------------------------------------------------------ #
     # Parsers & Localizers                                               #
     # ------------------------------------------------------------------ #
 
@@ -252,7 +241,22 @@ class BlumenthalArtsExtractor(BaseExtractor):
         except Exception:
             return None
 
-    
+    def _safe_navigate_to_ticket_page(self, sb, url):
+        """Standardized navigation with cookies and banners."""
+        safe_get_denver(sb, url)
+
+        for cookie in QUEUE_COOKIES:
+            try:
+                if cookie["domain"] in sb.get_current_url():
+                    sb.add_cookie(cookie)
+            except Exception as e:
+                self.custom_logger.debug(f"Failed to add cookie {cookie['name']}: {e}")
+
+        sb.refresh()
+        human_delay(1.5, 2.5)
+
+        accept_cookies(sb.driver, logger=self.custom_logger)
+
     def _get_theatre_details(self, theatre_name: str) -> dict:
         normalized_name = theatre_name.lower().strip() if theatre_name else ""
 
@@ -260,7 +264,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
             if key in normalized_name:
                 return data
         return DEFAULT_THEATRE_DETAILS
-
 
     # ============================================================
     # EVENTS LIST EXTRACTION
@@ -278,13 +281,22 @@ class BlumenthalArtsExtractor(BaseExtractor):
         seen_titles = set()
         for i, card in enumerate(cards, start=1):
             try:
-                title_el = card.find_element(By.CSS_SELECTOR,"h3.title a, h2.title a, .event-title a, a.event-link",)
+                title_el = card.find_element(
+                    By.CSS_SELECTOR,
+                    "h3.title a, h2.title a, .event-title a, a.event-link",
+                )
                 title = title_el.get_attribute("textContent").strip()
                 venue_url = title_el.get_attribute("href")
 
                 try:
-                    venue = card.find_element(By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue").get_attribute("textContent").strip()
-                except:
+                    venue = (
+                        card.find_element(
+                            By.CSS_SELECTOR, "div.event_venue, .venue, .eventVenue"
+                        )
+                        .get_attribute("textContent")
+                        .strip()
+                    )
+                except Exception:
                     venue = "Blumenthal Performing Arts"
 
                 self.custom_logger.info(f"  [{i}/{len(cards)}] {title}")
@@ -305,35 +317,57 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     }
                 )
             except Exception as e:
-                self.custom_logger.debug(f"⚠️ Event list item parse error at block index {i}: {e}")
-        
+                self.custom_logger.debug(
+                    f"Event list item parse error at block index {i}: {e}"
+                )
+
         self.custom_logger.debug(f" Total base events extracted: {len(events)}")
         return events
 
     # ============================================================
     # PERFORMANCE DATES EXTRACTION
     # ============================================================
+
     def _extract_events_performance_dates(self, sb) -> list:
         performances = []
         try:
             try:
-                # Look for the year in the heading section
-                year = sb.find_element(".event_heading .m-date__year").text.replace(",", "").strip()
-            except:
+                year = (
+                    sb.find_element(".event_heading .m-date__year")
+                    .text.replace(",", "")
+                    .strip()
+                )
+            except Exception:
                 year = str(datetime.now().year)
 
             blocks = sb.find_elements("div.event_showings li.listItem")
+            self.custom_logger.info(f" Found {len(blocks)} performance rows ")
+
             for idx, block in enumerate(blocks, start=1):
                 try:
                     try:
-                        month = block.find_element(By.CSS_SELECTOR, ".m-date__month, .month").get_attribute("textContent").strip()
-                        day = block.find_element(By.CSS_SELECTOR, ".m-date__day, .day").get_attribute("textContent").strip()
-                        time_text = block.find_element(By.CSS_SELECTOR, "span.time.cell, .time").get_attribute("textContent").strip()
+                        month = (
+                            block.find_element(
+                                By.CSS_SELECTOR, ".m-date__month, .month"
+                            )
+                            .get_attribute("textContent")
+                            .strip()
+                        )
+                        day = (
+                            block.find_element(By.CSS_SELECTOR, ".m-date__day, .day")
+                            .get_attribute("textContent")
+                            .strip()
+                        )
+                        time_text = (
+                            block.find_element(By.CSS_SELECTOR, "span.time.cell, .time")
+                            .get_attribute("textContent")
+                            .strip()
+                        )
                         date_string = f"{month} {day} {year} {time_text}"
                         parsed_dt = self._parse_date(date_string)
                     except Exception:
                         continue
-                        
+
                     if not parsed_dt:
                         continue
 
@@ -359,34 +393,31 @@ class BlumenthalArtsExtractor(BaseExtractor):
             self.custom_logger.warning(f"Structural performance extraction error: {e}")
         return performances
 
-
     # ============================================================
     # SVG SEATMAP SCRAPER
     # ============================================================
+
     def _extract_all_seats(self, sb) -> tuple:
-        """Extracts seats and pricing from the currently open SVG modal without looping infinitely."""
+        """Extracts seats and pricing from the currently open SVG modal.
 
-        self.custom_logger.info(" Extracting seats from all seat map sections...")
+        capacity = total circles across all sections (available + unavailable).
+        """
+        self.custom_logger.info(" \nExtracting seats from all seat map sections...")
 
-        all_seats = {}
-        seen_snapshots = set()  #  Track unique seat layouts to prevent loops
+        all_seats = {}  # priced seats: seat_id -> {seat, ticket_price}
+        all_seat_ids = set()  # ALL seat IDs (available + unavailable) for capacity
+        seen_snapshots = set()
         click_count = 0
         section_click_count = 0
         currency = None
 
         while True:
             try:
-                # ------------------------------------------------
-                # WAIT FOR SEAT MAP TO SETTLE
-                # ------------------------------------------------
                 sb.wait_for_element_present(
                     "circle[data-seat-row], g#screenMap polygon.picker", timeout=10
                 )
                 human_delay(1.0, 2.0)
 
-                # =================================================
-                # 1. HANDLE SVG SECTION SELECTION
-                # =================================================
                 sections = sb.find_elements("g#screenMap polygon.picker")
                 if sections:
                     self.custom_logger.info(f" \nFound {len(sections)} seat sections")
@@ -395,82 +426,94 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         aria = sec.get_attribute("aria-label") or ""
 
                         if sec.is_displayed():
-
-                            # Click the section to switch views
-                            sb.execute_script("""
+                            sb.execute_script(
+                                """
                             var element = arguments[0];
                             var evt = document.createEvent("MouseEvents");
                             evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
                             element.dispatchEvent(evt);
-                            """, sec)
+                            """,
+                                sec,
+                            )
                             section_click_count += 1
-
-                            self.custom_logger.info(f" Clicked section ({section_click_count}): {aria}")
+                            self.custom_logger.info(
+                                f" Clicked section ({section_click_count}): {aria}"
+                            )
                             human_delay(1.0, 1.5)
-                            break # Break out of the sections loop to parse the newly loaded elements
+                            break
 
-                # =================================================
-                # 2. COLLECT AND VALIDATE FRESH SEATS (Correct Sequence Placement)
-                # =================================================
                 seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
-                # Create a unique fingerprint string of current rows and seat numbers
-                seat_fingerprint = "|".join(sorted([
-                    (s.get_attribute("data-seat-row") or "") + (s.get_attribute("data-seat-seat") or "") 
-                    for s in seats
-                ]))
+                seat_fingerprint = "|".join(
+                    sorted(
+                        [
+                            (s.get_attribute("data-seat-row") or "")
+                            + (s.get_attribute("data-seat-seat") or "")
+                            for s in seats
+                        ]
+                    )
+                )
 
-                #  INFINITE LOOP PROTECTION: Stop if this view has already been scraped
                 if seat_fingerprint in seen_snapshots:
-                    self.custom_logger.info(" Duplicate state detected. Reached the end of sections.")
+                    self.custom_logger.info(
+                        " Duplicate state detected. Reached the end of sections."
+                    )
                     break
 
                 seen_snapshots.add(seat_fingerprint)
-                self.custom_logger.info(f" \nFound {len(seats)} unique seats in this section")
+                self.custom_logger.info(
+                    f" Found {len(seats)} unique seats in this section"
+                )
 
-                # =================================================
-                # 3. EXTRACT SEAT DATA
-                # =================================================
                 for seat in seats:
                     row_name = seat.get_attribute("data-seat-row")
                     seat_no = seat.get_attribute("data-seat-seat")
                     section = seat.get_attribute("data-seat-section")
                     aria = seat.get_attribute("aria-label") or ""
+                    status = seat.get_attribute("data-status") or ""
+
+                    section_name = section.split()[0].strip()
+
+                    seat_id = f"{section} {row_name}{seat_no}".strip()
+                    all_seat_ids.add(seat_id)  # count all seats for capacity
 
                     if not currency:
                         currency = get_currency_from_price(aria)
+
+                    # Only include available seats (data-status="A") in seat_pricing
+                    if status != "A":
+                        continue
 
                     match = re.search(r"\$([\d]+(?:\.\d+)?)", aria)
                     if not match:
                         continue
 
                     price = float(match.group(1))
+                    all_seats[seat_id] = {"seat": seat_id, "ticket_price": price}
 
-                    seat_id = f"{section} {row_name}{seat_no}".strip()
-                    # Deduplicate records by seat ID
-                    all_seats[seat_id] = {
-                        "seat": seat_id,
-                        "ticket_price": price
-                    }
-
-                # -----------------------------------
-                # 4. CLICK NEXT SECTION ARROW
-                # -----------------------------------
                 try:
-                    seatmap_arrow = sb.find_element("div.map-container button.bottom-arrow")
+                    seatmap_arrow = sb.find_element(
+                        "div.map-container button.bottom-arrow"
+                    )
 
-                    # Enhanced exit condition: Stop if hidden OR explicitly disabled via CSS class
-                    if not seatmap_arrow.is_displayed() or "disabled" in (seatmap_arrow.get_attribute("class") or ""):
-                        self.custom_logger.info(" Arrow button is hidden or disabled. Map processing complete.")
+                    if not seatmap_arrow.is_displayed() or "disabled" in (
+                        seatmap_arrow.get_attribute("class") or ""
+                    ):
+                        self.custom_logger.info(
+                            " Arrow button is hidden or disabled. Map processing complete."
+                        )
                         break
 
                     sb.execute_script("arguments[0].click();", seatmap_arrow)
                     click_count += 1
 
+                    self.custom_logger.info(f" Finished extracting seats from section : {section_name}")
                     self.custom_logger.info(f" Clicked seat map arrow ({click_count})")
                     human_delay(1.5, 2.0)
 
-                except Exception as e:
-                    self.custom_logger.info(" Reached final seat map section (Arrow element missing)")
+                except Exception:
+                    self.custom_logger.info(
+                         f" Reached final seat map section (Arrow element missing): {e}"
+                    )
                     break
 
             except Exception as e:
@@ -478,143 +521,147 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 break
 
         seat_list = list(all_seats.values())
-        capacity = len(all_seats)
+        capacity = len(all_seat_ids)  # available + unavailable
+        self.custom_logger.info(
+            f" Total capacity: {capacity} seats ({len(seat_list)} priced)"
+        )
         return seat_list, currency, capacity
 
     def _extract_seat_pricing_metrics(self, sb, performances) -> dict:
         seat_pricing = {}
         has_seat_map = False
 
-        # Save the original event details window handle
         main_window = sb.driver.current_window_handle
 
         for i, perf in enumerate(performances, 1):
-
             perf_key = f"{perf['date']} {perf['time']}"
 
             self.custom_logger.info(
-                f"  [{i}/{len(performances)}] Seats for {perf['date']} {perf['time']}")
-            
+                f"  [{i}/{len(performances)}] Seats for {perf['date']} {perf['time']}"
+            )
+
             try:
+                self._safe_navigate_to_ticket_page(sb, perf["get_ticket_btn"])
 
-                start = time.time()
+                try:
+                    main_window = sb.driver.current_window_handle
+                except Exception:
+                    pass
 
-                # -----------------------------------
-                # OPEN GET TICKETS PAGE
-                # -----------------------------------
-                # Clicking the button or loading the link triggers a new tab
-                sb.uc_open_with_reconnect(perf["get_ticket_btn"], reconnect_time=6)
-                human_delay(1.5, 2.5)
-   
-                # -----------------------------------
-                # GET TICKETS OPENS NEW TAB
-                # -----------------------------------
                 if len(sb.driver.window_handles) > 1:
-                    new_tab = [h for h in sb.driver.window_handles if h != main_window][0]
+                    new_tab = [h for h in sb.driver.window_handles if h != main_window][
+                        0
+                    ]
                     sb.driver.switch_to.window(new_tab)
 
-                if self._is_bot_protection(sb):
-                    self.custom_logger.warning(
-                        "UC Captcha Intercept triggered on ticket page. Solving..."
-                    )
-                    sb.uc_gui_click_captcha()
-                    human_delay(2.0, 3.0)
-
-                # -----------------------------------
-                # WAIT FOR BUY PAGE
-                # -----------------------------------
-                sb.wait_for_element_present("div.result-box-item", timeout=12)
-                rows = sb.find_elements("div.result-box-item")
                 target_row = None
-                
+                is_sold_out = False
 
-                for row in rows:
-                    try:
-                        # skip sold out
-                        availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
-                        if "Sold Out" in availability:
+                while True:
+                    sb.wait_for_element_present("div.result-box-item", timeout=12)
+                    rows = sb.find_elements("div.result-box-item")
+
+                    for row in rows:
+                        try:
+                            availability = (
+                                row.find_element(By.CSS_SELECTOR, ".availability-text")
+                                .get_attribute("textContent")
+                                .strip()
+                            )
+                            dt_text = (
+                                row.find_element(By.CSS_SELECTOR, ".start-date")
+                                .get_attribute("textContent")
+                                .strip()
+                            )
+                            row_dt = parser.parse(dt_text)
+
+                            row_date = row_dt.strftime("%Y-%m-%d")
+                            row_time = row_dt.strftime("%H:%M")
+
+                            if row_date == perf["date"] and row_time == perf["time"]:
+                                if "Sold Out" in availability:
+                                    self.custom_logger.info(
+                                        f"Performance {perf_key} is sold out."
+                                    )
+                                    is_sold_out = True
+                                else:
+                                    target_row = row
+                                    self.custom_logger.info(
+                                        f" Matched performance: {row_date} {row_time}"
+                                    )
+                                break
+
+                        except Exception as e:
+                            self.custom_logger.warning(f" Row match failed: {e}")
                             continue
 
-                        # Get row date/time
-                        dt_text = row.find_element(By.CSS_SELECTOR, ".start-date").text.strip()
-                        row_dt = parser.parse(dt_text)
+                    if is_sold_out:
+                        seat_pricing[perf_key] = []
+                        break
 
-                        row_date = row_dt.strftime("%Y-%m-%d")
-                        row_time = row_dt.strftime("%H:%M")
+                    if target_row:
+                        break
 
-                        # Match current performance
-                        if (
-                            row_date == perf["date"]
-                            and 
-                            row_time == perf["time"]
-                        ):
-
-                            target_row = row
-                        
-                            self.custom_logger.info(f" Matched performance: " f"{row_date} {row_time}")
+                    try:
+                        next_btn = sb.find_elements("#av-next-link a")
+                        if next_btn and not sb.is_element_visible(".disabled"):
+                            old_row = rows[0]
+                            sb.execute_script("arguments[0].click();", next_btn[0])
+                            sb.wait_for_stale(old_row, timeout=10)
+                        else:
+                            self.custom_logger.info(
+                                " Reached the last page. No available match found anywhere."
+                            )
                             break
 
-                    except Exception as e:
-                        self.custom_logger.warning(f" Row match failed: {e}", "warning")
-                        continue
+                    except Exception as pagination_error:
+                        self.custom_logger.warning(
+                            f" Failed to navigate pagination: {pagination_error}"
+                        )
+                        break
 
                 if not target_row:
-                    # Performance not found on ticket page (e.g. Cloudflare block) — keep empty entry
                     self.custom_logger.warning(" No available performance found")
+                    seat_pricing[perf_key] = []
                     continue
 
-                #-----------------------------------
-                # CLICK BUY
-                # -----------------------------------
-                buy_button = target_row.find_element(By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen")
+                buy_button = target_row.find_element(
+                    By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
+                )
                 sb.execute_script("arguments[0].click();", buy_button)
 
-                # ------------------------------------------------
-                # WAIT FOR SEAT MAP
-                # ------------------------------------------------
                 seat_list, currency, capacity = self._extract_all_seats(sb)
 
-                
-                seat_pricing[perf_key] = seat_list
-                perf["capacity"] = capacity
-                perf["currency"] = currency
-                    
-                self.custom_logger.info(
-                    f" Seats: {capacity} | "
-                    f"Time: {round(time.time()-start,2)}s"
-                )
-
-
-                
-                # -----------------------------------
-                # CLOSE BUY TAB
-                # -----------------------------------
-                if sb.driver.current_window_handle != main_window:
-                    sb.driver.close()
-                    sb.driver.switch_to.window(main_window)
-                    human_delay(1, 2)
-
-
-            except Exception as e:
-                self.custom_logger.debug(f"⚠️ seat extraction error: {e}", "warning")
+                if seat_list:
+                    has_seat_map = True
+                    seat_pricing[perf_key] = seat_list
+                    perf["capacity"] = capacity
+                    perf["currency"] = currency
+                    self.custom_logger.info(f" Seats: {len(seat_list)} ")
+                else:
+                    seat_pricing[perf_key] = []
 
                 try:
                     if sb.driver.current_window_handle != main_window:
                         sb.driver.close()
                         sb.driver.switch_to.window(main_window)
-                except:
+                except Exception:
                     pass
 
+            except Exception as e:
+                self.custom_logger.debug(f"seat extraction error: {e}")
+                seat_pricing.setdefault(perf_key, [])
                 continue
+
+        if not has_seat_map:
+            return {}
 
         return seat_pricing
 
 
 def main():
     extractor = BlumenthalArtsExtractor(
-        local_test=False,
-        save_csv_locally=True,
-        csv_incremental_mode=False
+        local_test=False, save_csv_locally=True, csv_incremental_mode=False
     )
 
     result = extractor.run()
