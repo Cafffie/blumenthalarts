@@ -12,6 +12,8 @@ from datetime import date, datetime
 import pandas as pd
 from dateutil import parser
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 from utils.base_extractor import BaseExtractor
 from utils.logger import setup_logger
@@ -413,11 +415,17 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
         while True:
             try:
+                # ------------------------------------------------
+                # WAIT FOR SEAT MAP TO SETTLE
+                # ------------------------------------------------
                 sb.wait_for_element_present(
                     "circle[data-seat-row], g#screenMap polygon.picker", timeout=10
                 )
                 human_delay(1.0, 2.0)
 
+                # =================================================
+                # 1. HANDLE SVG SECTION SELECTION
+                # =================================================
                 sections = sb.find_elements("g#screenMap polygon.picker")
                 if sections:
                     self.custom_logger.info(f" \nFound {len(sections)} seat sections")
@@ -442,6 +450,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             human_delay(1.0, 1.5)
                             break
 
+                # =================================================
+                # 2. COLLECT AND VALIDATE FRESH SEATS 
+                # =================================================
                 seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
                 seat_fingerprint = "|".join(
                     sorted(
@@ -453,6 +464,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     )
                 )
 
+                #  INFINITE LOOP PROTECTION: Stop if this view has already been scraped
                 if seat_fingerprint in seen_snapshots:
                     self.custom_logger.info(
                         " Duplicate state detected. Reached the end of sections."
@@ -464,6 +476,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     f" Found {len(seats)} unique seats in this section"
                 )
 
+                # =================================================
+                # 3. EXTRACT SEAT DATA
+                # =================================================
                 for seat in seats:
                     row_name = seat.get_attribute("data-seat-row")
                     seat_no = seat.get_attribute("data-seat-seat")
@@ -490,6 +505,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     price = float(match.group(1))
                     all_seats[seat_id] = {"seat": seat_id, "ticket_price": price}
 
+                # -----------------------------------
+                # 4. CLICK NEXT SECTION ARROW
+                # -----------------------------------
                 try:
                     seatmap_arrow = sb.find_element(
                         "div.map-container button.bottom-arrow"
@@ -522,6 +540,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
         seat_list = list(all_seats.values())
         capacity = len(all_seat_ids)  # available + unavailable
+        
         self.custom_logger.info(
             f" Total capacity: {capacity} seats ({len(seat_list)} priced)"
         )
@@ -541,19 +560,30 @@ class BlumenthalArtsExtractor(BaseExtractor):
             )
 
             try:
+                # -----------------------------------
+                # OPEN GET TICKETS PAGE
+                # -----------------------------------
+                # Clicking the button or loading the link triggers a new tab
                 self._safe_navigate_to_ticket_page(sb, perf["get_ticket_btn"])
 
+                # Refresh main_window after reconnect — UC mode may assign a new handle
                 try:
                     main_window = sb.driver.current_window_handle
                 except Exception:
                     pass
 
+                # -----------------------------------
+                # GET TICKETS OPENS NEW TAB
+                # -----------------------------------
                 if len(sb.driver.window_handles) > 1:
                     new_tab = [h for h in sb.driver.window_handles if h != main_window][
                         0
                     ]
                     sb.driver.switch_to.window(new_tab)
 
+                # -----------------------------------
+                # WAIT FOR BUY PAGE AND MATCH DATES
+                # -----------------------------------
                 target_row = None
                 is_sold_out = False
 
@@ -579,6 +609,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             row_time = row_dt.strftime("%H:%M")
 
                             if row_date == perf["date"] and row_time == perf["time"]:
+                                # skip sold out
                                 if "Sold Out" in availability:
                                     self.custom_logger.info(
                                         f"Performance {perf_key} is sold out."
@@ -595,19 +626,23 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             self.custom_logger.warning(f" Row match failed: {e}")
                             continue
 
+                    # EXIT LOGIC
                     if is_sold_out:
                         seat_pricing[perf_key] = []
+                        # Break the while-loop to move to next perf
                         break
 
+                    # If we successfully matched a performance, break out of pagination loop
                     if target_row:
                         break
 
+                    # If we checked all rows on this page and found nothing, handle the Next arrow
                     try:
                         next_btn = sb.find_elements("#av-next-link a")
                         if next_btn and not sb.is_element_visible(".disabled"):
                             old_row = rows[0]
                             sb.execute_script("arguments[0].click();", next_btn[0])
-                            sb.wait_for_stale(old_row, timeout=10)
+                            WebDriverWait(sb.driver, 10).until(EC.staleness_of(old_row))
                         else:
                             self.custom_logger.info(
                                 " Reached the last page. No available match found anywhere."
@@ -625,11 +660,17 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     seat_pricing[perf_key] = []
                     continue
 
+                # -----------------------------------
+                # CLICK BUY
+                # -----------------------------------
                 buy_button = target_row.find_element(
                     By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
                 )
                 sb.execute_script("arguments[0].click();", buy_button)
 
+                # ------------------------------------------------
+                # WAIT FOR SEAT MAP
+                # ------------------------------------------------
                 seat_list, currency, capacity = self._extract_all_seats(sb)
 
                 if seat_list:
@@ -641,6 +682,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 else:
                     seat_pricing[perf_key] = []
 
+                # -----------------------------------
+                # CLOSE BUY TAB and return to ticket list
+                # -----------------------------------
                 try:
                     if sb.driver.current_window_handle != main_window:
                         sb.driver.close()
