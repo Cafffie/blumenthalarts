@@ -319,13 +319,17 @@ def extract_events_performance_dates(driver):
 
                 # skip sold out
                 availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
+                sold_out = "sold_out" if sold_out in availability
+                buy_button  = row.find_element(By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen")
+                
                 #if "Sold Out" in availability:
                     #continue
 
                 performances.append({
                     "date": row_date,
                     "time": row_time,
-                    "available": availability if "Sold Out" not in availability else None
+                    "sold_out": sold_out if "Sold Out" else None,
+                    "buy_link": buy_button if availability != "sold_out" else None
                 })
 
                 # -----------------------------------
@@ -495,28 +499,13 @@ def _extract_seat_pricing_metrics(driver, performances):
 
         try:
             start = time.time()
-
-            # -----------------------------------
-            # OPEN GET TICKETS PAGE
-            # -----------------------------------
+            
             try:
-                # Clicking the button or loading the link triggers a new tab
-                driver.get(perf["get_ticket_btn"])
+                # Click the buy button 
+                driver.get(perf["buy_link"])
                 time.sleep(1.5)  # Give the browser a moment to register the new handle
             except:
                 log(f" This show is not on sale at the moment for {perf_key}")
-
-            # -----------------------------------
-            # GET TICKETS OPENS NEW TAB
-            # -----------------------------------
-            if len(driver.window_handles) > 1:
-
-                new_tab = [
-                    h for h in driver.window_handles
-                    if h != main_window][0]
-
-                driver.switch_to.window(new_tab)
-
             # ------------------------------------------------
             # CAPTCHA CHECK
             # ------------------------------------------------
@@ -530,55 +519,6 @@ def _extract_seat_pricing_metrics(driver, performances):
 
             log("✅ Page loaded")
 
-            # -----------------------------------
-            # WAIT FOR BUY PAGE
-            # -----------------------------------
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "div.result-box-item")))
-
-            rows = driver.find_elements(By.CSS_SELECTOR, "div.result-box-item")
-            target_row = None
-
-            for row in rows:
-                try:
-                    # skip sold out
-                    availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
-                    if "Sold Out" in availability:
-                        continue
-
-                    # Get row date/time
-                    dt_text = row.find_element(By.CSS_SELECTOR, ".start-date").text.strip()
-                    row_dt = parser.parse(dt_text)
-
-                    row_date = row_dt.strftime("%Y-%m-%d")
-                    row_time = row_dt.strftime("%H:%M")
-
-                    # Match current performance
-                    if (
-                        row_date == perf["date"]
-                        and
-                        row_time == perf["time"]
-                    ):
-
-                        target_row = row
-
-                        log(f"✅ Matched performance: " f"{row_date} {row_time}")
-                        break
-
-                except Exception as e:
-                  log(f"⚠️ Row match failed: {e}", "warning")
-                  continue
-
-            if not target_row:
-                log("⚠️ No available performance found")
-                continue
-
-            # -----------------------------------
-            # CLICK BUY
-            # -----------------------------------
-            buy_button  = target_row.find_element(By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen")
-            driver.execute_script("arguments[0].click();", buy_button )
-
             # ------------------------------------------------
             # WAIT FOR SEAT MAP
             # ------------------------------------------------
@@ -589,29 +529,12 @@ def _extract_seat_pricing_metrics(driver, performances):
             perf["capacity"] = capacity
             perf["currency"] = currency
 
-
             log(
                 f"✅ Seats: {capacity} | "
                 f"Time: {round(time.time()-start,2)}s"
             )
-
-            # -----------------------------------
-            # CLOSE BUY TAB
-            # -----------------------------------
-            if driver.current_window_handle != main_window:
-                driver.close()
-                driver.switch_to.window(main_window)
-
         except Exception as e:
             log(f"⚠️ seat extraction error: {e}", "warning")
-
-            try:
-                if driver.current_window_handle != main_window:
-                    driver.close()
-                    driver.switch_to.window(main_window)
-            except:
-                pass
-
             continue
 
     return seat_pricing
