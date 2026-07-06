@@ -1,20 +1,4 @@
-def extract_seats(self, sb) -> tuple:
-        """Extracts seats and pricing from the currently open SVG modal."""
 
-        max_capacity = None
-        currency = None
-        seat_list = []
-
-        try:
-            address = sb.find_element(".white-wrapper p.AreaAndVenueDetails").text.replace("\n", "")
-        except Exception:
-            return DEFAULT_THEATRE_DETAILS["address"]
-
-
-        try:
-            sb.wait_for_element_present("div.SeatingArea img, rect.seat", timeout=12)
-            seats = sb.find_elements(By.CSS_SELECTOR, "div.SeatingArea img[class*='Seat'], rect.seat")
-            self.customimport re
 import os
 import time
 import logging
@@ -726,47 +710,5 @@ def scrape_shows():
 
 
 if __name__ == "__main__":
-    scrape_shows()_logger.info(f" Found {len(seats)} unique seats. ")
-
-            for seat in seats:
-                tooltip = seat.get_attribute("tooltip") or seat.get_attribute("title") or ""
-                
-                perf_capacity = len(seats) if seats else None
-                if max_capacity is None or perf_capacity > max_capacity:
-                    max_capacity = perf_capacity
-                
-                if currency is None and tooltip:
-                    currency = get_currency_from_price(tooltip)
-
-                if not tooltip:
-                    continue
-
-                match = re.search(r"([A-Z]+\d+)\s*-\s*£?([\d,.]+)", tooltip)
-                if not match:
-                    continue
-                seat_id = match.group(1)
-                ticket_price = float(match.group(2).replace(",", ""))
-
-                style = img.get_attribute("style") or ""
-                top_match = re.search(r"top:\s*([\d.]+)%", style)
-                section = (
-                    "STALLS"
-                    if top_match and float(top_match.group(1)) < 59
-                    else "CIRCLE"
-                )
-
-                if "curve" in address.lower():
-                    seat_id = f"{section} {seat_id}"
-                else:
-                    seat_id = f"Studio {seat_id}"
-
-                seat_list.append({
-                    "seat": seat_id,
-                    "ticket_price": ticket_price
-                })
-
-        except Exception as e:
-            self.custom_logger.debug(f"Seat canvas extraction subloop failure: {e}")
-        
-        self.custom_logger.info(f" Total capacity: {max_capacity} seats ({len(seat_list)} priced)")
-        return seat_list, currency, max_capacity
+    scrape_shows()
+           
