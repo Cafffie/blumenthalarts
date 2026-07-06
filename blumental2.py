@@ -322,6 +322,18 @@ def extract_events_performance_dates(driver):
                 if not buy_button:
                     continue
 
+                try:
+                    # 3. Pagination logic: Try to go to the next page
+                    next_btn = driver.find_elements(By.CSS_SELECTOR, "#av-next-link a")
+                    if next_btn and not sb.is_element_visible(".disabled"):
+                        old_row = rows[0]
+                        driver.execute_script("arguments[0].click();", next_btn[0])
+                        driver.wait_for_stale(old_row, timeout=10)
+                    else:
+                        log("End of pages reached.")
+                        break
+                except:
+                    
                 performances.append({
                     "date": row_date,
                     "time": row_time,
