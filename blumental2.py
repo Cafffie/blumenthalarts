@@ -268,8 +268,6 @@ def extract_events_performance_dates(driver):
     main_window = driver.current_window_handle
 
     try:
-        # 1. Extract Global Metadata (Year and Venue URL)
-        # Using CSS Selectors based on your provided HTML
         try:
             page_get_ticket_btn = block.find_element(By.CSS_SELECTOR, "div.buttons a").get_attribute("href")
             time.sleep(1.5)
@@ -300,14 +298,12 @@ def extract_events_performance_dates(driver):
 
         log("✅ Page loaded")
 
-        # -----------------------------------
-        # WAIT FOR BUY PAGE
-        # -----------------------------------
+       # Wait for date block to appear
         WebDriverWait(driver, 10).until(EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "div.result-box-item")))
 
         date_blocks = driver.find_elements(By.CSS_SELECTOR, "div.result-box-item")
-        
+        log(f" Found {len(date_blocks)} perfomance rows") 
         for row in date_blocks:
             try:
                 # Get row date/time
@@ -319,11 +315,12 @@ def extract_events_performance_dates(driver):
 
                 # skip sold out
                 availability = row.find_element(By.CSS_SELECTOR, ".availability-text").text.strip()
+                if "Sold Out" in availability:
+                    continue
                 sold_out = "sold_out" if sold_out in availability
                 buy_button  = row.find_element(By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen")
-                
-                #if "Sold Out" in availability:
-                    #continue
+                if not buy_button:
+                    continue
 
                 performances.append({
                     "date": row_date,
@@ -332,9 +329,7 @@ def extract_events_performance_dates(driver):
                     "buy_link": buy_button if availability != "sold_out" else None
                 })
 
-                # -----------------------------------
-                # CLOSE BUY TAB
-                # -----------------------------------
+                # close the buy page
                 if driver.current_window_handle != main_window:
                     driver.close()
                     driver.switch_to.window(main_window)
@@ -489,11 +484,6 @@ def _extract_seat_pricing_metrics(driver, performances):
     log("💺 Extracting seat pricing...")
     seat_pricing = {}
 
-    # Save the original event details window handle
-    main_window = driver.current_window_handle
-
-    
-    
     for perf in performances:
         perf_key = f"{perf['date']} {perf['time']}"
 
@@ -505,6 +495,7 @@ def _extract_seat_pricing_metrics(driver, performances):
                 driver.get(perf["buy_link"])
                 time.sleep(1.5)  # Give the browser a moment to register the new handle
             except:
+                seat_pricing[perf_key] = []
                 log(f" This show is not on sale at the moment for {perf_key}")
             # ------------------------------------------------
             # CAPTCHA CHECK
@@ -534,6 +525,7 @@ def _extract_seat_pricing_metrics(driver, performances):
                 f"Time: {round(time.time()-start,2)}s"
             )
         except Exception as e:
+            seat_pricing[perf_key] = []
             log(f"⚠️ seat extraction error: {e}", "warning")
             continue
 
