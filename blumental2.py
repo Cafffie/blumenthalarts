@@ -508,7 +508,7 @@ def _extract_seat_pricing_metrics(driver, performances):
                 time.sleep(1.5)  # Give the browser a moment to register the new handle
             except:
                 seat_pricing[perf_key] = []
-                log(f" This show is not on sale at the moment for {perf_key}")
+                log(f" This show is sold out for {perf_key}")
             # ------------------------------------------------
             # CAPTCHA CHECK
             # ------------------------------------------------
