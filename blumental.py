@@ -22,10 +22,9 @@ RUN_HEADLESS = False
 OUTPUT_FILE = "output.csv"
 
 PAGES = [
-    ("https://www.blumenthalarts.org/events-tickets/category/broadway-at-blumenthal", "Musical"),
-    ("https://www.blumenthalarts.org/events-tickets/category/theater", "Play")
+    ("https://www.blumenthalarts.org/events-tickets/category/theater", "Play"),
+    ("https://www.blumenthalarts.org/events-tickets/category/broadway-at-blumenthal", "Musical")
 ]
-
 
 # ============================================================
 # LOGGING
@@ -65,7 +64,7 @@ def setup_browser():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
-    driver = uc.Chrome(options=options, version_main=147)
+    driver = uc.Chrome(options=options, version_main=148)
     log("✅ Browser ready")
     return driver
 
@@ -265,44 +264,72 @@ def extract_events_performance_dates(driver):
     performances = []
 
     try:
-        # 1. Extract Global Metadata (Year and Venue URL)
-        # Using CSS Selectors based on your provided HTML
         try:
-            # Look for the year in the heading section
+            # Extract date and time from header and sidebar
             year = driver.find_element(By.CSS_SELECTOR, ".event_heading .m-date__year").text.replace(",", "").strip()
-        except:
+            header_date_text = driver.find_element(By.CSS_SELECTOR, ".event_heading span.m-date__singleDate").get_attribute("textContent").strip()
+            sidebar_time_text = driver.find_element(By.CSS_SELECTOR, "li.sidebar_event_starts span").get_attribute("textContent").strip()
+            
+            sidebar_date_string = f"{header_date_text} {sidebar_time_text}"
+            header_date = parser.parse(sidebar_date_string).strftime("%Y-%m-%d")
+            sidebar_time = parser.parse(sidebar_date_string).strftime("%H:%M")
+
+            log(f" sidebar_date_string found: {sidebar_date_string}")
+            log(f" sidebar_time found: {header_date}")
+            log(f" sidebar_time found: {sidebar_time}")
+        except Exception as e:
+            header_date = None
+            sidebar_time = None
             year = str(datetime.now().year) # Fallback to current year
+            log("Header/Sidebar parsing skipped")
 
         try:
-            # Look for the venue link in the event_venue div
-            venue_url = driver.find_element(By.CSS_SELECTOR, ".event_venue a").get_attribute("href")
-        except:
-            venue_url = None
+            page_get_ticket_btn = driver.find_element(By.CSS_SELECTOR, ".buttonWrapper .buttons a.tickets ").get_attribute("href")
+            log(f" page_get_ticket_btn found")
+        except Exception as e:
+            page_get_ticket_btn = None
+            log(f" This show is not on sale at the moment")
 
         # 2. Extract Performance Rows
         blocks = driver.find_elements(By.CSS_SELECTOR, "div.event_showings li.listItem")
         log(f"📦 Found {len(blocks)} performance rows for the year {year}")
 
-        for idx, block in enumerate(blocks, start=1):
-            try:
-                # Assuming _parse_performance_datetime is defined elsewhere
-                # We pass the 'year' we extracted above
-                parsed_dt = _parse_performance_datetime(block, year)
-                date_ymd = parsed_dt.strftime("%Y-%m-%d")
-                time_hm = parsed_dt.strftime("%H:%M")
+        # Handle Single-Performance Pages (0 rows found in the table)
+        if len(blocks) == 0:
+            log(" No row elements found. Treating this as a single-performance event layout.")
+            performances.append({
+                "date": header_date,
+                "time": sidebar_time,
+                "get_ticket_btn": page_get_ticket_btn 
+            })
+        else:
+            # Handle Multi-Performance 
+            for idx, block in enumerate(blocks, start=1):
+                try:
+                    # Assuming _parse_performance_datetime is defined elsewhere
+                    # We pass the 'year' we extracted above
+                    parsed_dt = _parse_performance_datetime(block, year)
+                    date_ymd = parsed_dt.strftime("%Y-%m-%d") 
+                    time_hm = parsed_dt.strftime("%H:%M") 
 
-                get_ticket_btn = block.find_element(
-                    By.CSS_SELECTOR, "a.tickets").get_attribute("href")
+                    try:
+                        get_ticket_btn = block.find_element(By.CSS_SELECTOR, "a.tickets").get_attribute("href")
+                    except Exception:
+                        get_ticket_btn = None
 
-                # 3. Append data including global metadata
-                performances.append({
-                    "date": date_ymd,
-                    "time": time_hm,
-                    "get_ticket_btn": get_ticket_btn 
-                })
+                    # Fallback to page-level button if block-level is missing
+                    if not get_ticket_btn:
+                        get_ticket_btn = page_get_ticket_btn
 
-            except Exception as e:
-                log(f"⚠️ Single performance parse failed on block index {idx}: {e}", "warning")
+                    # 3. Append data including global metadata
+                    performances.append({
+                        "date": date_ymd,
+                        "time": time_hm ,
+                        "get_ticket_btn": get_ticket_btn 
+                    })
+
+                except Exception as e:
+                    log(f"⚠️ Single performance parse failed on block index {idx}: {e}", "warning")
 
     except Exception as e:
         log(f"❌ Structural performance extraction error: {e}", "warning")
@@ -445,15 +472,20 @@ def _extract_seat_pricing_metrics(driver, performances):
     main_window = driver.current_window_handle
 
     for perf in performances:
+        perf_key = f"{perf['date']} {perf['time']}"
+
         try:
             start = time.time()
 
             # -----------------------------------
             # OPEN GET TICKETS PAGE
             # -----------------------------------
-            # Clicking the button or loading the link triggers a new tab
-            driver.get(perf["get_ticket_btn"])
-            time.sleep(1.5)  # Give the browser a moment to register the new handle
+            try:
+                # Clicking the button or loading the link triggers a new tab
+                driver.get(perf["get_ticket_btn"])
+                time.sleep(1.5)  # Give the browser a moment to register the new handle
+            except:
+                log(f" This show is not on sale at the moment for {perf_key}")
 
             # -----------------------------------
             # GET TICKETS OPENS NEW TAB
@@ -543,7 +575,7 @@ def _extract_seat_pricing_metrics(driver, performances):
                 f"✅ Seats: {capacity} | "
                 f"Time: {round(time.time()-start,2)}s"
             )
-
+            
             # -----------------------------------
             # CLOSE BUY TAB
             # -----------------------------------
@@ -583,7 +615,7 @@ def scrape_shows():
         scroll_to_load_all(driver)
         events = extract_events(driver, category)
 
-        for i, e in enumerate(events[-2:], start=1):
+        for i, e in enumerate(events[-5:], start=1):
             log(f"\n🎭 EVENT SPECIFIC EXTRACTION {i}/{len(events)} → {e['title']}")
 
             if not safe_get(driver, e["event_url"]):
