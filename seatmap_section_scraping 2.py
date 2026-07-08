@@ -1,75 +1,208 @@
-def extract_all_seats(driver):
-    """Extracts seats and pricing from all sections sequentially without looping back."""
-    log("\nExtracting seats from all seat map sections...")
+def _scrape_performance_seats(self, sb) -> tuple[list, int | None, str | None]:
+        """Extract all seat data from the currently-loaded performance page.
 
-    all_seats = {}
-    currency = None
+        Returns (seats, capacity, currency).
+        seats is an empty list when scraping failed or no available seats found.
+        """
+        seat_data = []
+        perf_capacity = 0
+        currency = None
 
-    # Wait for macro-level tier selections to load
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, "g#screenMap polygon.picker")
-    ))
-    time.sleep(1)
-
-    # Gather the unique IDs of all sections to prevent stale element issues
-    sections = driver.find_elements(By.CSS_SELECTOR, "g#screenMap polygon.picker")
-    section_ids = [sec.get_attribute("id") for sec in sections if sec.get_attribute("id")]
-    
-    log(f"🧭 Found {len(section_ids)} master seat sections to process.")
-
-    # Loop precisely through each section ID exactly once
-    for index, sec_id in enumerate(section_ids, 1):
         try:
-            # Re-find the element by ID to ensure it isn't stale
-            sec = driver.find_element(By.ID, sec_id)
-            aria = sec.get_attribute("aria-label") or f"Section {index}"
-            log(f"🎭 Switching to section ({index}/{len(section_ids)}): {aria}")
-            
-            # Click the section via JavaScript event injection
-            driver.execute_script("""
-                var element = arguments[0];
-                var evt = document.createEvent("MouseEvents");
-                evt.initMouseEvent("click", true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
-                element.dispatchEvent(evt);
-            """, sec)
-            
-            # Wait for the corresponding section's individual seat circles to render
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "circle[data-seat-row][data-seat-seat]")
-            ))
-            time.sleep(2)  # Give DOM stability transition time
+            sb.wait_for_ready_state_complete()
+            human_delay(2, 3)
 
-            # Collect seats specific to the active view
-            seats = driver.find_elements(By.CSS_SELECTOR, "circle[data-seat-row][data-seat-seat]")
-            log(f"📦 Found {len(seats)} seats in this section view")
+            dropdown_selector = SELECTORS["seating_dropdown"]
+            has_dropdown = False
+            areas = []
 
-            for seat in seats:
-                row_name = seat.get_attribute("data-seat-row")
-                seat_no = seat.get_attribute("data-seat-seat")
-                section = seat.get_attribute("data-seat-section")
-                aria_seat = (seat.get_attribute("aria-label") or "")
+            try:
+                sb.wait_for_element_present(dropdown_selector, timeout=15)
+                has_dropdown = True
+                self.custom_logger.info("Dropdown found on main page")
+            except Exception:
+                pass
 
-                if not currency:
-                    currency = detect_currency(aria_seat)
+            if not has_dropdown:
+                try:
+                    iframes = sb.find_elements("iframe")
+                    for iframe in iframes:
+                        try:
+                            sb.switch_to_frame(iframe)
+                            human_delay(2, 3)
+                            sb.execute_script("window.scrollTo(0, 300);")
+                            human_delay(1, 2)
+                            sb.execute_script("window.scrollTo(0, 0);")
+                            human_delay(1, 2)
+                            sb.wait_for_element_present(dropdown_selector, timeout=25)
+                            has_dropdown = True
+                            self.custom_logger.info("Dropdown found in iframe")
+                            break
+                        except Exception:
+                            sb.switch_to_default_content()
+                except Exception as iframe_err:
+                    self.custom_logger.warning("iframe search failed: %s", iframe_err)
 
-                match = re.search(r"\$([\d]+(?:\.\d+)?)", aria_seat)
-                if not match:
+            if has_dropdown:
+                raw_options = sb.execute_script(
+                    """
+                    var select = document.querySelector(arguments[0]);
+                    if (!select) return [];
+                    var options = [];
+                    for (var i = 0; i < select.options.length; i++) {
+                        options.push(select.options[i].text.trim());
+                    }
+                    return options;
+                    """,
+                    dropdown_selector,
+                )
+                areas = [o for o in raw_options if o and o != "The Matcham Auditorium"]
+                self.custom_logger.info("Found dropdown with areas: %s", areas)
+            else:
+                self.custom_logger.info("No dropdown — using single level seating")
+                areas = ["Stalls"]
+
+            prev_seat_count = -1  # sentinel: no area scraped yet
+
+            for area in areas:
+                try:
+                    self.custom_logger.info("Selecting area: %s", area)
+
+                    if has_dropdown:
+                        try:
+                            result = sb.execute_script(
+                                """
+                                var select = document.querySelector(arguments[0]);
+                                if (!select) return false;
+                                var areaName = arguments[1];
+                                for (var i = 0; i < select.options.length; i++) {
+                                    if (select.options[i].text.trim() === areaName) {
+                                        select.value = select.options[i].value;
+                                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                                        return true;
+                                    }
+                                }
+                                return false;
+                                """,
+                                dropdown_selector,
+                                area,
+                            )
+                            if not result:
+                                self.custom_logger.warning(
+                                    "Could not find area %s in dropdown", area
+                                )
+                                continue
+                            sb.wait_for_ready_state_complete()
+                            for _ in range(15):
+                                human_delay(2, 3)
+                                # Break only when the seat count changes from the
+                                # previous area — proving the iframe re-rendered.
+                                # Without this check the stale previous-area chart
+                                # (still visible during re-render) triggers a false
+                                # break and every subsequent area returns wrong data.
+                                _cur_count = len(
+                                    sb.find_elements(
+                                        By.CSS_SELECTOR, SELECTORS["all_seats"]
+                                    )
+                                )
+                                if _cur_count > 0 and _cur_count != prev_seat_count:
+                                    break
+                                sb.execute_script("window.scrollTo(0, 300);")
+                                human_delay(1, 2)
+                                sb.execute_script("window.scrollTo(0, 0);")
+                        except Exception as dropdown_error:
+                            self.custom_logger.warning(
+                                "Failed to select area %s: %s", area, dropdown_error
+                            )
+                            continue
+
+                    self.custom_logger.info("Scraping seats for: %s", area)
+
+                    try:
+                        all_seats = sb.find_elements(
+                            By.CSS_SELECTOR, SELECTORS["all_seats"]
+                        )
+                        self.custom_logger.info(f" Found {len(all_seats)} unique seats. ")
+                        area_capacity = len(all_seats)
+                        prev_seat_count = area_capacity  # update for next area
+                        perf_capacity += area_capacity
+
+                        self.custom_logger.info(
+                            "Area: %s | Total Seats: %s", area, area_capacity
+                        )
+
+                        seat_tooltips = sb.execute_script(
+                            """
+                            var elems = document.querySelectorAll(arguments[0]);
+                            var out = [];
+                            for (var i = 0; i < elems.length; i++) {
+                                out.push(elems[i].getAttribute('tooltip') || elems[i].getAttribute('title') || '');
+                            }
+                            return out;
+                            """,
+                            SELECTORS["available_seats"],
+                        )
+
+                        for tooltip in seat_tooltips:
+                            try:
+                                if not tooltip or tooltip == "Unavailable":
+                                    continue
+                                price_match = re.search(
+                                    r"[£$€](\d+(?:\.\d+)?)", tooltip
+                                )
+                                if not price_match:
+                                    continue
+                                price_val = price_match.group(1)
+                                parts = tooltip.split(" - ")
+                                price_idx = next(
+                                    (
+                                        i
+                                        for i, p in enumerate(parts)
+                                        if re.match(r"[£$€]", p.strip())
+                                    ),
+                                    None,
+                                )
+                                seat_id = (
+                                    " ".join(p.strip() for p in parts[:price_idx])
+                                    if price_idx
+                                    else parts[0].strip()
+                                )
+                                seat_data.append(
+                                    {
+                                        "seat": f"{area} {seat_id}",
+                                        "ticket_price": float(price_val),
+                                    }
+                                )
+                                if currency is None:
+                                    currency = get_currency_from_price(
+                                        price_match.group()
+                                    )
+                            except Exception as seat_error:
+                                self.custom_logger.warning(
+                                    "Failed to parse seat: %s", seat_error
+                                )
+                                continue
+
+                    except Exception as seat_extraction_error:
+                        self.custom_logger.error(
+                            "Seat extraction error for area %s: %s",
+                            area,
+                            seat_extraction_error,
+                        )
+                        continue
+
+                except Exception as area_error:
+                    self.custom_logger.warning(
+                        "Failed to process area %s: %s", area, area_error
+                    )
                     continue
-                    
-                price = float(match.group(1))
-                seat_id = f"{section} {row_name}{seat_no}".strip()
-                
-                all_seats[seat_id] = {
-                    "seat": seat_id,
-                    "ticket_price": price
-                }
 
         except Exception as e:
-            log(f"⚠️ Error extraction failed on section {sec_id}: {e}", "warning")
-            continue  # Proceed to the next section tier even if one fails
+            self.custom_logger.error("Seat map scraping failed: %s", e)
+        finally:
+            try:
+                sb.switch_to_default_content()
+            except Exception:
+                pass
 
-    seat_list = list(all_seats.values())
-    capacity = len(seat_list)
-    log(f"🎟 Total unique seats extracted: {capacity}")
-
-    return seat_list, currency, capacity
+        return seat_data, (perf_capacity if perf_capacity > 0 else None), currency
