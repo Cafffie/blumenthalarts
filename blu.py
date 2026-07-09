@@ -24,7 +24,6 @@ from utils.scraping_helpers import (
     human_delay,
     human_scroll,
     safe_get_denver,
-    standardize_category,
 )
 
 from .blumenthal_arts_config import (
@@ -99,6 +98,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 human_scroll(sb)
                 events = self._extract_events(sb, category)
 
+                open_date, close_date = self._extract_event_dates(sb)
+                self.custom_logger.info(f" Extracted Event Dates: {open_date} - {close_date}")
+
                 if self.local_test and self.show_count:
                     events = events[: self.show_count]
                     self.custom_logger.info(
@@ -135,6 +137,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             raise RuntimeError(f"Failed to load {e['venue_url']}")
 
                         human_scroll(sb)
+
                         performances = self._extract_events_performance_dates(sb)
 
                         seat_pricing = self._extract_seat_pricing_metrics(
@@ -163,11 +166,12 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
                         if performances:
                             sorted_dates = sorted([p["date"] for p in performances])
+
+                        if not open_date:   
                             open_date = sorted_dates[0]
+
+                        if not close_date:  
                             close_date = sorted_dates[-1]
-                        else:
-                            open_date = datetime.now().strftime("%Y-%m-%d")
-                            close_date = datetime.now().strftime("%Y-%m-%d")
 
                         formatted_performances = [
                             {"date": p["date"], "time": p["time"]} for p in performances
@@ -178,7 +182,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         row = {
                             "title": e["title"],
                             "venue_url": e["venue_url"],
-                            "category": standardize_category(e["category"]),
+                            "category": None,  # standardize_category(e["category"]),
                             "venue": e["venue"]
                             if e["venue"]
                             else "Blumenthal Performing Arts",
@@ -267,6 +271,29 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 return data
         return DEFAULT_THEATRE_DETAILS
 
+
+    def _extract_event_dates(self, sb):
+
+        try:
+            date_box = sb.find_element("div.date-override")
+
+            months = [m.text.strip() for m in date_box.find_elements(By.CSS_SELECTOR, ".m-date__month")]
+            days = [d.text.strip() for d in date_box.find_elements(By.CSS_SELECTOR, ".m-date__day")]
+            year = date_box.find_element(By.CSS_SELECTOR, ".m-date__year").text.replace(",", "").strip()
+
+            open_date = datetime.strptime(f"{months[0]} {days[0]} {year}", "%B %d %Y").date()
+            close_date = datetime.strptime(f"{months[1]} {days[1]} {year}", "%b %d %Y").date()
+            date_range = f"{open_date} - {close_date}"
+
+            #self.custom_logger.info(f" open_date: {open_date}")
+            #self.custom_logger.info(f" close_date: {close_date}")
+            self.custom_logger.info(f" date_range: {date_range}")
+
+        except Exception as e:
+            self.custom_logger.error(f"Error occurred while extracting event dates: {e}")
+
+        return open_date, close_date
+
     # ============================================================
     # EVENTS LIST EXTRACTION
     # ============================================================
@@ -339,60 +366,119 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     .text.replace(",", "")
                     .strip()
                 )
+                header_date_text = (
+                    sb.find_element(
+                        By.CSS_SELECTOR, ".event_heading span.m-date__singleDate"
+                    )
+                    .get_attribute("textContent")
+                    .strip()
+                )
+                sidebar_time_text = (
+                    sb.find_element(By.CSS_SELECTOR, "li.sidebar_event_starts span")
+                    .get_attribute("textContent")
+                    .strip()
+                )
+
+                sidebar_date_string = f"{header_date_text} {sidebar_time_text}"
+                header_date = parser.parse(sidebar_date_string).strftime("%Y-%m-%d")
+                sidebar_time = parser.parse(sidebar_date_string).strftime("%H:%M")
+
+                self.custom_logger.info(f" sidebar_date_string: {sidebar_date_string}")
             except Exception:
+                header_date = None
+                sidebar_time = None
                 year = str(datetime.now().year)
+
+            try:
+                page_get_ticket_btn = sb.find_element(
+                    By.CSS_SELECTOR, ".buttonWrapper .buttons a.tickets "
+                ).get_attribute("href")
+            except Exception:
+                page_get_ticket_btn = None
+                self.custom_logger.info("This show is not on sale at the moment")
 
             blocks = sb.find_elements("div.event_showings li.listItem")
             self.custom_logger.info(f" Found {len(blocks)} performance rows ")
 
-            for idx, block in enumerate(blocks, start=1):
-                try:
+            # Handle Single-Performance Pages (0 rows found in the table)
+            if len(blocks) == 0:
+                self.custom_logger.info(
+                    " No row elements found. Treating this as a single-performance event layout."
+                )
+                performances.append(
+                    {
+                        "date": header_date,
+                        "time": sidebar_time,
+                        "get_ticket_btn": page_get_ticket_btn,
+                    }
+                )
+            else:
+                # Handle Multi-Performance
+                for idx, block in enumerate(blocks, start=1):
                     try:
-                        month = (
-                            block.find_element(
-                                By.CSS_SELECTOR, ".m-date__month, .month"
+                        try:
+                            month = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, ".m-date__month, .month"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
                             )
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        day = (
-                            block.find_element(By.CSS_SELECTOR, ".m-date__day, .day")
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        time_text = (
-                            block.find_element(By.CSS_SELECTOR, "span.time.cell, .time")
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        date_string = f"{month} {day} {year} {time_text}"
-                        parsed_dt = self._parse_date(date_string)
-                    except Exception:
-                        continue
+                            day = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, ".m-date__day, .day"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
+                            )
+                            time_text = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, "span.time.cell, .time"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
+                            )
+                            date_string = f"{month} {day} {year} {time_text}"
+                            self.custom_logger.info(f" date_string: {date_string}")
 
-                    if not parsed_dt:
-                        continue
+                            parsed_dt = parser.parse(date_string)
+                        except Exception:
+                            continue
 
-                    date_ymd = parsed_dt.strftime("%Y-%m-%d")
-                    time_hm = parsed_dt.strftime("%H:%M")
-                    
-                    get_ticket_btn = block.find_element(By.CSS_SELECTOR, "a.tickets").get_attribute("href")
-                    if not get_ticket_btn:
-                        self.custom_logger.info("Get ticket button URL is missing")
-                        continue
+                        if not parsed_dt:
+                            continue
 
-                    performances.append(
-                        {
-                            "date": date_ymd,
-                            "time": time_hm,
-                            "get_ticket_btn": get_ticket_btn if get_ticket_btn else None,
-                            "year": year,
-                        }
-                    )
-                except Exception as e:
-                    self.custom_logger.debug(
-                        f"Single performance parse failed on index {idx}: {e}"
-                    )
+                        date_ymd = parsed_dt.strftime("%Y-%m-%d")
+                        time_hm = parsed_dt.strftime("%H:%M")
+
+                        try:
+                            get_ticket_btn = block.find_element(
+                                By.CSS_SELECTOR, "a.tickets"
+                            ).get_attribute("href")
+                        except Exception:
+                            get_ticket_btn = None
+
+                        # Fallback to page-level button if block-level is missing
+                        #if not get_ticket_btn:
+                            #get_ticket_btn = page_get_ticket_btn
+
+                        # Log a note if the link is missing, but let it proceed to append
+                        # if not get_ticket_btn:
+                        # self.custom_logger.info(f" No booking link available for performance {idx}. Saving date and time only.")
+
+                        performances.append(
+                            {
+                                "date": date_ymd,
+                                "time": time_hm,
+                                "get_ticket_btn": get_ticket_btn
+                                if get_ticket_btn
+                                else None,
+                            }
+                        )
+                    except Exception as e:
+                        self.custom_logger.debug(
+                            f"Single performance parse failed on index {idx}: {e}"
+                        )
         except Exception as e:
             self.custom_logger.warning(f"Structural performance extraction error: {e}")
         return performances
@@ -456,6 +542,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # 2. COLLECT AND VALIDATE FRESH SEATS
                 # =================================================
                 seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
+                human_delay(1.5, 3.0)
                 seat_fingerprint = "|".join(
                     sorted(
                         [
@@ -561,7 +648,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
             self.custom_logger.info(
                 f"  [{i}/{len(performances)}] Seats for {perf['date']} {perf['time']}"
-            ) 
+            )
 
             try:
                 # -----------------------------------
@@ -574,6 +661,8 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     self.custom_logger.info(
                         f" This show is not on sale at the moment for {perf_key}"
                     )
+                    seat_pricing[perf_key] = []
+                    continue
 
                 # Refresh main_window after reconnect — UC mode may assign a new handle
                 try:
@@ -675,8 +764,15 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 buy_button = target_row.find_element(
                     By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
                 )
-                sb.execute_script("arguments[0].click();", buy_button)
-
+                # sb.execute_script("arguments[0].click();", buy_button)
+                try:
+                    sb.execute_script("arguments[0].click();", buy_button)
+                    human_delay(1.0, 2.0)
+                    human_scroll(sb)
+                except Exception as click_error:
+                    self.custom_logger.info(
+                        f" Failed to click buy button for {perf_key}: {click_error}"
+                    )
                 # ------------------------------------------------
                 # WAIT FOR SEAT MAP
                 # ------------------------------------------------
@@ -689,7 +785,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     perf["currency"] = currency
                     self.custom_logger.info(f" Seats: {len(seat_list)} ")
                 else:
-                    self.custom_logger.info(f"No seatmap available for performance {perf_key}")
+                    self.custom_logger.info(
+                        f"No seatmap available for performance {perf_key}"
+                    )
                     seat_pricing[perf_key] = []
 
                 # -----------------------------------
