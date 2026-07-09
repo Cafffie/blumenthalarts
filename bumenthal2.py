@@ -372,15 +372,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
     def _extract_events_performance_dates(self, sb) -> list:
         performances = []
         try:
-            try:
-                # Look for the year in the heading section
-                year = (
-                    sb.find_element(".event_heading .m-date__year")
-                    .text.replace(",", "")
-                    .strip()
-                )
-            except Exception:
-                year = str(datetime.now().year)
 
             blocks = sb.find_elements("div.event_showings li.listItem")
             self.custom_logger.info(f" Found {len(blocks)} performance rows ")
@@ -405,6 +396,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             .get_attribute("textContent")
                             .strip()
                         )
+                        year = str(datetime.now().year)
                         date_string = f"{month} {day} {year} {time_text}"
                         parsed_dt = self._parse_date(date_string)
                     except Exception:
