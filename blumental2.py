@@ -7,7 +7,7 @@ Seat map:  SVG Map extraction inside individual show ticket pages.
 import json
 import re
 import sys
-from datetime import date, datetime
+from datetime import datetime
 
 import pandas as pd
 from dateutil import parser
@@ -24,6 +24,7 @@ from utils.scraping_helpers import (
     human_delay,
     human_scroll,
     safe_get_denver,
+    standardize_category,
 )
 
 from .blumenthal_arts_config import (
@@ -177,7 +178,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         row = {
                             "title": e["title"],
                             "venue_url": e["venue_url"],
-                            "category": None,  # standardize_category(e["category"]),
+                            "category": standardize_category(e["category"]),
                             "venue": e["venue"]
                             if e["venue"]
                             else "Blumenthal Performing Arts",
@@ -191,7 +192,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             "upcoming_performances": formatted_performances,
                             "capacity": capacity,
                             "currency": currency,
-                            "is_limited_run": "True" if close_date else "False",
+                            "is_limited_run": None,
                             "seat_pricing": seat_pricing,
                             "scrape_datetime": get_scrape_datetime(),
                         }
@@ -233,13 +234,12 @@ class BlumenthalArtsExtractor(BaseExtractor):
     # Parsers & Localizers                                               #
     # ------------------------------------------------------------------ #
 
-    def _parse_date(self, text: str) -> date | None:
+    def _parse_date(self, text: str) -> str | None:
         try:
             dt = parser.parse(text, dayfirst=True, fuzzy=True)
-            if dt.date() < date.today():
-                dt = dt.replace(year=dt.year + 1)
             return dt
-        except Exception:
+        except Exception as e:
+            self.custom_logger.error(f"_parse_date failed for '{text}': {e}")
             return None
 
     def _safe_navigate_to_ticket_page(self, sb, url):
@@ -352,8 +352,9 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 )
 
                 sidebar_date_string = f"{header_date_text} {sidebar_time_text}"
-                header_date = parser.parse(sidebar_date_string).strftime("%Y-%m-%d")
-                sidebar_time = parser.parse(sidebar_date_string).strftime("%H:%M")
+                parsed_dt = self._parse_date(sidebar_date_string)
+                header_date = parsed_dt.strftime("%Y-%m-%d")
+                sidebar_time = parsed_dt.strftime("%H:%M")
 
                 self.custom_logger.info(f" sidebar_date_string: {sidebar_date_string}")
             except Exception:
@@ -385,7 +386,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     }
                 )
             else:
-                # Handle Multi-Performance
                 for idx, block in enumerate(blocks, start=1):
                     try:
                         try:
@@ -410,8 +410,10 @@ class BlumenthalArtsExtractor(BaseExtractor):
                                 .get_attribute("textContent")
                                 .strip()
                             )
+
                             date_string = f"{month} {day} {year} {time_text}"
-                            parsed_dt = parser.parse(date_string)
+                            self.custom_logger.info(f" date_string: {date_string}")
+                            parsed_dt = self._parse_date(date_string)
                         except Exception:
                             continue
 
@@ -428,14 +430,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         except Exception:
                             get_ticket_btn = None
 
-                        # Fallback to page-level button if block-level is missing
-                        #if not get_ticket_btn:
-                            #get_ticket_btn = page_get_ticket_btn
-
-                        # Log a note if the link is missing, but let it proceed to append
-                        # if not get_ticket_btn:
-                        # self.custom_logger.info(f" No booking link available for performance {idx}. Saving date and time only.")
-
                         performances.append(
                             {
                                 "date": date_ymd,
@@ -449,6 +443,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                         self.custom_logger.debug(
                             f"Single performance parse failed on index {idx}: {e}"
                         )
+
         except Exception as e:
             self.custom_logger.warning(f"Structural performance extraction error: {e}")
         return performances
@@ -484,10 +479,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # =================================================
                 # 1. HANDLE SVG SECTION SELECTION
                 # =================================================
-                sb.execute_script("window.scrollTo(0, 300);")
-                human_delay(1, 2)
-                sb.execute_script("window.scrollTo(0, 0);")
-                human_delay(1, 2)
                 sections = sb.find_elements("g#screenMap polygon.picker")
                 if sections:
                     self.custom_logger.info(f" \nFound {len(sections)} seat sections")
@@ -515,8 +506,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # =================================================
                 # 2. COLLECT AND VALIDATE FRESH SEATS
                 # =================================================
-                sb.execute_script("window.scrollTo(0, 300);")
-                human_delay(1, 2)
                 seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
                 seat_fingerprint = "|".join(
                     sorted(
@@ -636,6 +625,8 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     self.custom_logger.info(
                         f" This show is not on sale at the moment for {perf_key}"
                     )
+                    seat_pricing[perf_key] = []
+                    continue
 
                 # Refresh main_window after reconnect — UC mode may assign a new handle
                 try:
@@ -737,19 +728,19 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 buy_button = target_row.find_element(
                     By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
                 )
-                # sb.execute_script("arguments[0].click();", buy_button)
+
                 try:
                     sb.execute_script("arguments[0].click();", buy_button)
-                    human_delay(2, 3)
+                    human_delay(1.0, 2.0)
+                    human_scroll(sb)
                 except Exception as click_error:
                     self.custom_logger.info(
                         f" Failed to click buy button for {perf_key}: {click_error}"
                     )
+
                 # ------------------------------------------------
                 # WAIT FOR SEAT MAP
                 # ------------------------------------------------
-                sb.wait_for_ready_state_complete()
-                human_delay(2, 3)
                 seat_list, currency, capacity = self._extract_all_seats(sb)
 
                 if seat_list:
@@ -759,9 +750,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     perf["currency"] = currency
                     self.custom_logger.info(f" Seats: {len(seat_list)} ")
                 else:
-                    self.custom_logger.info(
-                        f"No seatmap available for performance {perf_key}"
-                    )
                     seat_pricing[perf_key] = []
 
                 # -----------------------------------
@@ -780,7 +768,6 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 continue
 
         if not has_seat_map:
-            self.custom_logger.info("This show has no seat map available")
             return {}
 
         return seat_pricing
