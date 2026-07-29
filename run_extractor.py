@@ -7,24 +7,25 @@ Seat map:  SVG Map extraction inside individual show ticket pages.
 import json
 import re
 import sys
-from datetime import date, datetime
+from datetime import datetime
 
 import pandas as pd
 from dateutil import parser
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 from utils.base_extractor import BaseExtractor
 from utils.logger import setup_logger
-from utils.scraping_helpers import (
+from utils.scraping_helpers import (  # standardize_category,
     accept_cookies,
     get_currency_from_price,
     get_scrape_datetime,
     human_delay,
     human_scroll,
+    normalize_country,
+    parse_booking_dates,
     safe_get_denver,
-    standardize_category,
 )
 
 from .blumenthal_arts_config import (
@@ -162,37 +163,39 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             currency = None
 
                         if performances:
-                            sorted_dates = sorted([p["date"] for p in performances])
-                            open_date = sorted_dates[0]
-                            close_date = sorted_dates[-1]
-                        else:
-                            open_date = datetime.now().strftime("%Y-%m-%d")
-                            close_date = datetime.now().strftime("%Y-%m-%d")
+                            sorted_dates = sorted(p["date"] for p in performances)
+
+                            if not e["open_date"]:
+                                e["open_date"] = sorted_dates[0]
+
+                            if not e["close_date"]:
+                                e["close_date"] = sorted_dates[-1]
 
                         formatted_performances = [
                             {"date": p["date"], "time": p["time"]} for p in performances
                         ]
 
                         theatre_details = self._get_theatre_details(e["venue"])
+                        country = theatre_details["country"]
 
                         row = {
                             "title": e["title"],
                             "venue_url": e["venue_url"],
-                            "category": standardize_category(e["category"]),
+                            "category": None,
                             "venue": e["venue"]
                             if e["venue"]
                             else "Blumenthal Performing Arts",
                             "address": theatre_details["address"],
                             "city": theatre_details["city"],
-                            "country": theatre_details["country"],
-                            "open_date": open_date,
-                            "close_date": close_date,
-                            "booking_start_date": open_date,
-                            "booking_end_date": close_date,
+                            "country": normalize_country(country),
+                            "open_date": e["open_date"],
+                            "close_date": e["close_date"],
+                            "booking_start_date": None,
+                            "booking_end_date": e["close_date"],
                             "upcoming_performances": formatted_performances,
                             "capacity": capacity,
                             "currency": currency,
-                            "is_limited_run": "True" if close_date else "False",
+                            "is_limited_run": None,
                             "seat_pricing": seat_pricing,
                             "scrape_datetime": get_scrape_datetime(),
                         }
@@ -234,13 +237,12 @@ class BlumenthalArtsExtractor(BaseExtractor):
     # Parsers & Localizers                                               #
     # ------------------------------------------------------------------ #
 
-    def _parse_date(self, text: str) -> date | None:
+    def _parse_date(self, text: str) -> str | None:
         try:
             dt = parser.parse(text, dayfirst=True, fuzzy=True)
-            if dt.date() < date.today():
-                dt = dt.replace(year=dt.year + 1)
             return dt
-        except Exception:
+        except Exception as e:
+            self.custom_logger.error(f"_parse_date failed for '{text}': {e}")
             return None
 
     def _safe_navigate_to_ticket_page(self, sb, url):
@@ -310,11 +312,29 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 if not venue_url or not venue_url.startswith("http"):
                     continue
 
+                try:
+                    date_box_el = (
+                        card.find_element(By.CSS_SELECTOR, "div.date-override")
+                        .get_attribute("textContent")
+                        .strip()
+                    )
+                    # self.custom_logger.info(f"date_box_el: {date_box_el}")
+
+                    booking_dates = parse_booking_dates(date_box_el)
+                    open_date = booking_dates.get("start_date")
+                    close_date = booking_dates.get("end_date")
+
+                    self.custom_logger.info(f"date_range: {open_date} - {close_date}")
+                except Exception as e:
+                    self.custom_logger.error(f"Error extracting event dates: {e}")
+
                 events.append(
                     {
                         "title": title,
                         "venue_url": venue_url,
                         "category": category,
+                        "open_date": open_date,
+                        "close_date": close_date,
                         "venue": venue,
                     }
                 )
@@ -339,58 +359,119 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     .text.replace(",", "")
                     .strip()
                 )
-            except Exception:
+            except Exception as e:
                 year = str(datetime.now().year)
+                self.custom_logger.info(
+                    f"Year error, falling back to current year: {e}"
+                )
+
+            try:
+                header_date_text = (
+                    sb.find_element(
+                        By.CSS_SELECTOR, ".event_heading span.m-date__singleDate"
+                    )
+                    .get_attribute("textContent")
+                    .strip()
+                )
+                sidebar_time_text = (
+                    sb.find_element(By.CSS_SELECTOR, "li.sidebar_event_starts span")
+                    .get_attribute("textContent")
+                    .strip()
+                )
+
+                sidebar_date_string = f"{header_date_text} {sidebar_time_text}"
+                parsed_dt = self._parse_date(sidebar_date_string)
+                header_date = parsed_dt.strftime("%Y-%m-%d")
+                sidebar_time = parsed_dt.strftime("%H:%M")
+
+                self.custom_logger.info(f" sidebar_date_string: {sidebar_date_string}")
+            except Exception:
+                header_date = None
+                sidebar_time = None
+
+            try:
+                page_get_ticket_btn = sb.find_element(
+                    By.CSS_SELECTOR, ".buttonWrapper .buttons a.tickets "
+                ).get_attribute("href")
+            except Exception:
+                page_get_ticket_btn = None
+                self.custom_logger.info("This show is not on sale at the moment")
 
             blocks = sb.find_elements("div.event_showings li.listItem")
             self.custom_logger.info(f" Found {len(blocks)} performance rows ")
 
-            for idx, block in enumerate(blocks, start=1):
-                try:
+            # Handle Single-Performance Pages (0 rows found in the table)
+            if len(blocks) == 0:
+                self.custom_logger.info(
+                    " No row elements found. Treating this as a single-performance event layout."
+                )
+                performances.append(
+                    {
+                        "date": header_date,
+                        "time": sidebar_time,
+                        "get_ticket_btn": page_get_ticket_btn,
+                    }
+                )
+            else:
+                for idx, block in enumerate(blocks, start=1):
                     try:
-                        month = (
-                            block.find_element(
-                                By.CSS_SELECTOR, ".m-date__month, .month"
+                        try:
+                            month = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, ".m-date__month, .month"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
                             )
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        day = (
-                            block.find_element(By.CSS_SELECTOR, ".m-date__day, .day")
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        time_text = (
-                            block.find_element(By.CSS_SELECTOR, "span.time.cell, .time")
-                            .get_attribute("textContent")
-                            .strip()
-                        )
-                        date_string = f"{month} {day} {year} {time_text}"
-                        parsed_dt = self._parse_date(date_string)
-                    except Exception:
-                        continue
+                            day = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, ".m-date__day, .day"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
+                            )
+                            time_text = (
+                                block.find_element(
+                                    By.CSS_SELECTOR, "span.time.cell, .time"
+                                )
+                                .get_attribute("textContent")
+                                .strip()
+                            )
 
-                    if not parsed_dt:
-                        continue
+                            date_string = f"{month} {day} {year} {time_text}"
+                            # self.custom_logger.info(f" date_string: {date_string}")
+                            parsed_dt = self._parse_date(date_string)
+                        except Exception:
+                            continue
 
-                    date_ymd = parsed_dt.strftime("%Y-%m-%d")
-                    time_hm = parsed_dt.strftime("%H:%M")
-                    get_ticket_btn = block.find_element(
-                        By.CSS_SELECTOR, "a.tickets"
-                    ).get_attribute("href")
+                        if not parsed_dt:
+                            continue
 
-                    performances.append(
-                        {
-                            "date": date_ymd,
-                            "time": time_hm,
-                            "get_ticket_btn": get_ticket_btn,
-                            "year": year,
-                        }
-                    )
-                except Exception as e:
-                    self.custom_logger.debug(
-                        f"Single performance parse failed on index {idx}: {e}"
-                    )
+                        date_ymd = parsed_dt.strftime("%Y-%m-%d")
+                        time_hm = parsed_dt.strftime("%H:%M")
+                        # self.custom_logger.info(f"date_ymd: {date_ymd} | time_hm: {time_hm}")
+
+                        try:
+                            get_ticket_btn = block.find_element(
+                                By.CSS_SELECTOR, "a.tickets"
+                            ).get_attribute("href")
+                        except Exception:
+                            get_ticket_btn = None
+
+                        performances.append(
+                            {
+                                "date": date_ymd,
+                                "time": time_hm,
+                                "get_ticket_btn": get_ticket_btn
+                                if get_ticket_btn
+                                else None,
+                            }
+                        )
+                    except Exception as e:
+                        self.custom_logger.debug(
+                            f"Single performance parse failed on index {idx}: {e}"
+                        )
+
         except Exception as e:
             self.custom_logger.warning(f"Structural performance extraction error: {e}")
         return performances
@@ -451,7 +532,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
                             break
 
                 # =================================================
-                # 2. COLLECT AND VALIDATE FRESH SEATS 
+                # 2. COLLECT AND VALIDATE FRESH SEATS
                 # =================================================
                 seats = sb.find_elements("circle[data-seat-row][data-seat-seat]")
                 seat_fingerprint = "|".join(
@@ -524,13 +605,15 @@ class BlumenthalArtsExtractor(BaseExtractor):
                     sb.execute_script("arguments[0].click();", seatmap_arrow)
                     click_count += 1
 
-                    self.custom_logger.info(f" Finished extracting seats from section : {section_name}")
+                    self.custom_logger.info(
+                        f" Finished extracting seats from section : {section_name}"
+                    )
                     self.custom_logger.info(f" Clicked seat map arrow ({click_count})")
                     human_delay(1.5, 2.0)
 
                 except Exception:
                     self.custom_logger.info(
-                         f" Reached final seat map section (Arrow element missing): {e}"
+                        " Reached final seat map section (Arrow element missing)"
                     )
                     break
 
@@ -540,7 +623,7 @@ class BlumenthalArtsExtractor(BaseExtractor):
 
         seat_list = list(all_seats.values())
         capacity = len(all_seat_ids)  # available + unavailable
-        
+
         self.custom_logger.info(
             f" Total capacity: {capacity} seats ({len(seat_list)} priced)"
         )
@@ -563,8 +646,15 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 # -----------------------------------
                 # OPEN GET TICKETS PAGE
                 # -----------------------------------
-                # Clicking the button or loading the link triggers a new tab
-                self._safe_navigate_to_ticket_page(sb, perf["get_ticket_btn"])
+                try:
+                    # Clicking the button or loading the link triggers a new tab
+                    self._safe_navigate_to_ticket_page(sb, perf["get_ticket_btn"])
+                except Exception:
+                    self.custom_logger.info(
+                        f" This show is not on sale at the moment for {perf_key}"
+                    )
+                    seat_pricing[perf_key] = []
+                    continue
 
                 # Refresh main_window after reconnect — UC mode may assign a new handle
                 try:
@@ -603,10 +693,13 @@ class BlumenthalArtsExtractor(BaseExtractor):
                                 .get_attribute("textContent")
                                 .strip()
                             )
+                            # self.custom_logger.info(f"dt_text: {dt_text}")
+
                             row_dt = parser.parse(dt_text)
 
                             row_date = row_dt.strftime("%Y-%m-%d")
                             row_time = row_dt.strftime("%H:%M")
+                            # self.custom_logger.info(f"row_date: {row_date} | row_time: {row_time}")
 
                             if row_date == perf["date"] and row_time == perf["time"]:
                                 # skip sold out
@@ -666,7 +759,15 @@ class BlumenthalArtsExtractor(BaseExtractor):
                 buy_button = target_row.find_element(
                     By.CSS_SELECTOR, "a.btn.btn-primary, #popupDivOpen"
                 )
-                sb.execute_script("arguments[0].click();", buy_button)
+
+                try:
+                    sb.execute_script("arguments[0].click();", buy_button)
+                    human_delay(1.0, 2.0)
+                    human_scroll(sb)
+                except Exception as click_error:
+                    self.custom_logger.info(
+                        f" Failed to click buy button for {perf_key}: {click_error}"
+                    )
 
                 # ------------------------------------------------
                 # WAIT FOR SEAT MAP
